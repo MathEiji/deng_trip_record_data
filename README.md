@@ -10,16 +10,39 @@ This repository contains data pipelines and exploration using **New York City Ta
 
 - **Format:** Parquet (e.g. `fhvhv_tripdata_YYYY-MM.parquet`)
 - **Typical size:** Tens of millions of rows per month (~21M for Jan 2026 sample)
-- **Notebooks** assume the parquet file is at `../fhvhv_tripdata_2026-01.parquet` relative to the repo; adjust the path in each notebook if yours is elsewhere.
+- **Location:** Downloaded files live in `data/staging/` (git-ignored). Run the download script to fetch them.
 
 ---
 
 ## Repo structure
 
-| Item | Description |
-|------|-------------|
-| `data_check.ipynb` | Ad-hoc checks and counts on the FHVHV parquet (DuckDB + pandas). |
-| `raw_tables_exploration.ipynb` | Data exploration and design of **raw tables** split by **context**. |
+```
+deng_trip_record_data/
+├── app/
+│   └── src/
+│       ├── download_trip_data.py   # Download FHVHV parquets from the TLC CDN
+│       └── requirements.txt        # App dependencies (requests)
+├── data/
+│   └── staging/                    # Downloaded parquet files (git-ignored)
+├── notebooks/
+│   ├── data_check.ipynb            # Ad-hoc checks and counts (DuckDB + pandas)
+│   ├── raw_tables_exploration.ipynb# Raw tables design by context
+│   └── requirements.txt           # Notebook dependencies (pandas, duckdb, pyarrow, requests)
+├── .gitignore
+└── README.md
+```
+
+---
+
+## Downloading data
+
+Use `download_trip_data.py` to fetch FHVHV parquet files for a range of months:
+
+```bash
+python app/src/download_trip_data.py 2025-01 2025-06
+```
+
+Files are saved to `data/staging/`. Already-downloaded files are skipped on re-run.
 
 ---
 
@@ -36,11 +59,12 @@ The raw layer splits the single FHVHV parquet into logical tables. Each table in
 | **raw_fare_payment** | Fare and payment | `base_passenger_fare`, `tolls`, `bcf`, `sales_tax`, `congestion_surcharge`, `airport_fee`, `tips`, `driver_pay`, `cbd_congestion_fee` |
 | **raw_request_flags** | Request flags | `shared_request_flag`, `shared_match_flag`, `access_a_ride_flag`, `wav_request_flag`, `wav_match_flag` |
 
-See `raw_tables_exploration.ipynb` for schema inspection, sampling, and optional code to write these tables to Parquet.
+See `notebooks/raw_tables_exploration.ipynb` for schema inspection, sampling, and optional code to write these tables to Parquet.
 
 ---
 
 ## Setup
 
-- **Python:** 3.x with `pandas`, `duckdb`.
-- Install with e.g. `pip install pandas duckdb pyarrow` (pyarrow for parquet I/O).
+- **Python:** 3.x
+- **App dependencies:** `pip install -r app/src/requirements.txt`
+- **Notebook dependencies:** `pip install -r notebooks/requirements.txt`
