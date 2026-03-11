@@ -8,7 +8,7 @@ from pathlib import Path
 import requests
 
 BASE_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data"
-OUTPUT_DIR = Path(__file__).parent / "data/staging"
+OUTPUT_DIR = Path(__file__).parent / "../../data/staging"
 
 
 def month_range(start: str, end: str) -> list[str]:
