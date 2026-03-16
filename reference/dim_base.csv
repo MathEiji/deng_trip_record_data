@@ -1,0 +1,10 @@
+base_number,base_name,parent_company,base_type
+B03404,Uber Technologies Inc.,Uber,hvfhs_dispatch
+B03406,Lyft Inc.,Lyft,hvfhs_dispatch
+B02510,Juno USA LP,Juno,hvfhs_dispatch
+B03352,Via Transportation Inc.,Via,hvfhs_dispatch
+B02026,Affiliated base,Uber,originating
+B00887,Affiliated base,Uber,originating
+B01312,Affiliated base,Uber,originating
+B02003,Affiliated base,Uber,originating
+B03380,Affiliated base,Lyft,originating
