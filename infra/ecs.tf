@@ -46,6 +46,51 @@ resource "aws_ecs_task_definition" "download_trip_data" {
   ])
 }
 
+resource "aws_ecs_task_definition" "build_raw_layer" {
+  family                   = "${var.project_name}-build-raw"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "1024" # 1 vCPU
+  memory                   = "4096" # 4 GB — headroom for DuckDB materialization
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+  task_role_arn            = aws_iam_role.ecs_task.arn
+
+  ephemeral_storage {
+    size_in_gib = 40
+  }
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  container_definitions = jsonencode([
+    {
+      name      = "build-raw-layer"
+      image     = "${aws_ecr_repository.app.repository_url}:latest"
+      essential = true
+      command   = ["src/build_raw_layer.py"]
+
+      environment = [
+        { name = "S3_BUCKET", value = var.s3_bucket_name },
+        { name = "S3_STAGING_PREFIX", value = "staging" },
+        { name = "S3_RAW_PREFIX", value = "raw" },
+        { name = "GLUE_DATABASE", value = var.glue_database },
+        { name = "AWS_REGION", value = var.aws_region },
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
+          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-stream-prefix" = "build-raw"
+        }
+      }
+    }
+  ])
+}
+
 resource "aws_security_group" "ecs_task" {
   name_prefix = "${var.project_name}-ecs-"
   description = "Allow outbound internet access for ECS Fargate tasks"

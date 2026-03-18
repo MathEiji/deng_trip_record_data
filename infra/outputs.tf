@@ -32,3 +32,9 @@ output "subnet_ids" {
   description = "Default VPC subnet IDs for ECS tasks"
   value       = join(",", data.aws_subnets.default.ids)
 }
+
+output "iam_user_passwords" {
+  description = "Initial passwords for developer IAM users (terraform output -json iam_user_passwords)"
+  value       = { for k, v in aws_iam_user_login_profile.developers : k => v.password }
+  sensitive   = true
+}

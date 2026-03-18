@@ -2,9 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY src/requirements.txt .
+COPY app/src/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/ ./src/
+COPY app/src/ ./src/
+COPY reference/ ./reference/
 
-ENTRYPOINT ["python", "src/download_trip_data.py"]
+ENTRYPOINT ["python"]
+CMD ["src/download_trip_data.py"]

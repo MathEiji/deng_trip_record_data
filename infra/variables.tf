@@ -37,3 +37,9 @@ variable "end_month" {
   type        = string
   default     = "2025-06"
 }
+
+variable "glue_database" {
+  description = "Glue Data Catalog database name for the raw layer"
+  type        = string
+  default     = "trip_record_data"
+}
