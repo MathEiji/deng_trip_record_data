@@ -8,12 +8,12 @@ terraform {
     }
   }
 
-  # Uncomment to use S3 backend for remote state:
-  # backend "s3" {
-  #   bucket = "your-terraform-state-bucket"
-  #   key    = "trip-record-data/terraform.tfstate"
-  #   region = "us-east-1"
-  # }
+  backend "s3" {
+    bucket  = "usp-pece-poli-deng-trip-record-data-tfstate"
+    key     = "trip-record-data/terraform.tfstate"
+    region  = "us-east-1"
+    encrypt = true
+  }
 }
 
 provider "aws" {
