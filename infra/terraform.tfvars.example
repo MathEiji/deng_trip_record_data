@@ -1,0 +1,7 @@
+aws_region     = "us-east-1"
+project_name   = "trip-record-data"
+github_org     = "your-github-username"
+github_repo    = "deng_trip_record_data"
+s3_bucket_name = "your-globally-unique-bucket-name"
+start_month    = "2025-01"
+end_month      = "2025-06"

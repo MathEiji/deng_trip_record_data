@@ -18,11 +18,24 @@ This repository contains data pipelines and exploration using **New York City Ta
 
 ```
 deng_trip_record_data/
+├── .github/
+│   └── workflows/
+│       └── deploy.yml              # CI/CD: build → ECR → ECS task definition
 ├── app/
+│   ├── Dockerfile                  # Container image for download job
 │   └── src/
 │       ├── download_trip_data.py   # Download FHVHV parquets from the TLC CDN
 │       ├── build_raw_layer.py      # Build raw tables from staging data
 │       └── requirements.txt        # App dependencies (requests, duckdb)
+├── infra/                          # Terraform (ECS Fargate + ECR + S3 + IAM)
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── ecr.tf
+│   ├── ecs.tf
+│   ├── iam.tf
+│   ├── s3.tf
+│   └── cloudwatch.tf
 ├── data/
 │   ├── staging/                    # Downloaded parquet files (git-ignored)
 │   └── raw/                        # Context-based raw tables (git-ignored)
@@ -92,6 +105,45 @@ Reference/lookup tables stored as CSVs in `reference/` and converted to parquet 
 | **dim_base** | TLC base number → company | `base_number`, `base_name`, `parent_company`, `base_type` |
 
 See `notebooks/raw_tables_exploration.ipynb` for schema inspection, sampling, and optional code to write these tables to Parquet.
+
+---
+
+## Infrastructure & Deployment
+
+The project uses **ECS Fargate** (ARM64/Graviton) to run the download job in AWS, with **GitHub Actions** for CI/CD. All infrastructure is defined as Terraform in `infra/`.
+
+### AWS resources (free-tier optimised)
+
+| Resource | Purpose | Free tier note |
+|----------|---------|----------------|
+| **ECR** | Docker image registry | 500 MB storage |
+| **ECS Fargate** | Run download task (0.25 vCPU / 0.5 GB, ARM64) | 50 vCPU-hrs + 100 GB-hrs/month (12 months) |
+| **S3** | Store trip record parquets | 5 GB standard storage |
+| **CloudWatch Logs** | Task logs (7-day retention) | 5 GB ingestion |
+
+### First-time setup
+
+```bash
+cd infra
+cp terraform.tfvars.example terraform.tfvars   # edit with your values
+terraform init
+terraform plan
+terraform apply
+```
+
+After `terraform apply`, set the following GitHub repository secret:
+
+| Secret | Value (from Terraform output) |
+|--------|-------------------------------|
+| `AWS_ROLE_ARN` | `github_actions_role_arn` |
+
+### CI/CD pipeline
+
+The GitHub Actions workflow (`.github/workflows/deploy.yml`) runs on every push to `main` that touches `app/`:
+
+1. **build-and-push** — Builds the ARM64 Docker image and pushes to ECR
+2. **deploy** — Registers a new ECS task definition revision with the updated image
+3. **run-task** *(manual only)* — Triggers the Fargate task via `workflow_dispatch` with configurable `start_month` / `end_month`
 
 ---
 

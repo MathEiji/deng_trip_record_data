@@ -1,0 +1,168 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - ".github/workflows/deploy.yml"
+
+  workflow_dispatch:
+    inputs:
+      run_task:
+        description: "Run ECS task after deploy"
+        type: boolean
+        default: false
+      start_month:
+        description: "Start month (YYYY-MM)"
+        type: string
+        default: "2025-01"
+      end_month:
+        description: "End month (YYYY-MM)"
+        type: string
+        default: "2025-06"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: trip-record-data
+  ECS_CLUSTER: trip-record-data
+  TASK_FAMILY: trip-record-data-download
+
+jobs:
+  # ── Build Docker image and push to ECR ──────────────────────────
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          docker buildx build \
+            --platform linux/arm64 \
+            --push \
+            -t "${IMAGE}:${IMAGE_TAG}" \
+            -t "${IMAGE}:latest" \
+            app/
+          echo "image=${IMAGE}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+  # ── Register new ECS task definition revision ──────────────────
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update ECS task definition
+        env:
+          NEW_IMAGE: ${{ needs.build-and-push.outputs.image }}
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition "${TASK_FAMILY}" \
+            --query taskDefinition)
+
+          UPDATED=$(echo "${TASK_DEF}" | jq \
+            --arg IMAGE "${NEW_IMAGE}" \
+            '.containerDefinitions[0].image = $IMAGE')
+
+          CLEANED=$(echo "${UPDATED}" | jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )')
+
+          echo "${CLEANED}" > task-def.json
+          aws ecs register-task-definition --cli-input-json file://task-def.json
+          echo "Task definition updated with image: ${NEW_IMAGE}"
+
+  # ── Optionally run the ECS task (manual trigger only) ──────────
+  run-task:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.run_task == 'true'
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run ECS Fargate task
+        run: |
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=default-for-az,Values=true" \
+            --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${ECS_CLUSTER}-ecs-*" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "${ECS_CLUSTER}" \
+            --task-definition "${TASK_FAMILY}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SG_ID}],assignPublicIp=ENABLED}" \
+            --overrides "{
+              \"containerOverrides\": [{
+                \"name\": \"download-trip-data\",
+                \"environment\": [
+                  {\"name\": \"START_MONTH\", \"value\": \"${{ github.event.inputs.start_month }}\"},
+                  {\"name\": \"END_MONTH\",   \"value\": \"${{ github.event.inputs.end_month }}\"}
+                ]
+              }]
+            }" \
+            --query 'tasks[0].taskArn' --output text)
+
+          echo "Task started: ${TASK_ARN}"
+
+          echo "Waiting for task to complete..."
+          aws ecs wait tasks-stopped \
+            --cluster "${ECS_CLUSTER}" \
+            --tasks "${TASK_ARN}"
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "${ECS_CLUSTER}" \
+            --tasks "${TASK_ARN}" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+
+          echo "Task exit code: ${EXIT_CODE}"
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "::error::ECS task failed with exit code ${EXIT_CODE}"
+            exit 1
+          fi

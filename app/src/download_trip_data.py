@@ -1,14 +1,32 @@
-"""Download FHVHV trip data parquet files from the NYC TLC CloudFront CDN."""
+"""Download FHVHV trip data parquet files from the NYC TLC CDN and upload to S3.
+
+Designed to run inside an ECS Fargate task.  Configuration is read from
+environment variables (with CLI fallback for local development):
+
+    S3_BUCKET     – target S3 bucket  (required)
+    S3_PREFIX     – key prefix inside the bucket  (default: "staging")
+    START_MONTH   – first month to download, YYYY-MM
+    END_MONTH     – last  month to download, YYYY-MM
+"""
 
 import argparse
+import logging
+import os
 import sys
 from datetime import datetime
-from pathlib import Path
 
+import boto3
 import requests
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
 BASE_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data"
-OUTPUT_DIR = Path(__file__).parent / "../../data/staging"
+MULTIPART_CHUNK = 8 * 1024 * 1024  # 8 MB
 
 
 def month_range(start: str, end: str) -> list[str]:
@@ -29,50 +47,121 @@ def month_range(start: str, end: str) -> list[str]:
     return months
 
 
-def download_file(url: str, dest: Path) -> None:
-    """Stream-download *url* to *dest*, printing progress."""
-    with requests.get(url, stream=True, timeout=30) as resp:
+def s3_key_exists(s3_client, bucket: str, key: str) -> bool:
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except s3_client.exceptions.ClientError:
+        return False
+
+
+def stream_to_s3(
+    url: str, s3_client, bucket: str, key: str, timeout: int = 60
+) -> int:
+    """Stream-download *url* and upload to S3 via multipart upload.
+
+    Returns the total number of bytes uploaded.
+    """
+    with requests.get(url, stream=True, timeout=timeout) as resp:
         resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0))
-        downloaded = 0
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = downloaded / total * 100
-                    print(f"\r  {downloaded / 1e6:.1f} / {total / 1e6:.1f} MB ({pct:.0f}%)", end="", flush=True)
-        print()
+        content_length = int(resp.headers.get("content-length", 0))
+
+        mpu = s3_client.create_multipart_upload(Bucket=bucket, Key=key)
+        upload_id = mpu["UploadId"]
+        parts: list[dict] = []
+        part_number = 1
+        uploaded = 0
+
+        try:
+            for chunk in resp.iter_content(chunk_size=MULTIPART_CHUNK):
+                part = s3_client.upload_part(
+                    Bucket=bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                    PartNumber=part_number,
+                    Body=chunk,
+                )
+                parts.append({"ETag": part["ETag"], "PartNumber": part_number})
+                uploaded += len(chunk)
+                part_number += 1
+
+                if content_length:
+                    pct = uploaded / content_length * 100
+                    log.info(
+                        "  %s: %.1f / %.1f MB (%.0f%%)",
+                        key, uploaded / 1e6, content_length / 1e6, pct,
+                    )
+
+            s3_client.complete_multipart_upload(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+            )
+        except Exception:
+            s3_client.abort_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id,
+            )
+            raise
+
+    return uploaded
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("start", help="Start month in YYYY-MM format (e.g. 2025-01)")
-    parser.add_argument("end", help="End month in YYYY-MM format (e.g. 2025-06)")
+    parser.add_argument("start", nargs="?", help="Start month YYYY-MM (or env START_MONTH)")
+    parser.add_argument("end", nargs="?", help="End month YYYY-MM (or env END_MONTH)")
+    parser.add_argument("--bucket", help="S3 bucket (or env S3_BUCKET)")
+    parser.add_argument("--prefix", help="S3 key prefix (or env S3_PREFIX)")
     args = parser.parse_args(argv)
 
-    months = month_range(args.start, args.end)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    bucket = args.bucket or os.environ.get("S3_BUCKET")
+    prefix = (args.prefix or os.environ.get("S3_PREFIX", "staging")).strip("/")
+    start = args.start or os.environ.get("START_MONTH")
+    end = args.end or os.environ.get("END_MONTH")
 
-    print(f"Downloading {len(months)} file(s) to {OUTPUT_DIR}/\n")
+    if not bucket:
+        log.error("S3_BUCKET is required (pass --bucket or set S3_BUCKET env var)")
+        sys.exit(1)
+    if not start or not end:
+        log.error("START_MONTH and END_MONTH are required (positional args or env vars)")
+        sys.exit(1)
+
+    months = month_range(start, end)
+    s3_client = boto3.client("s3")
+
+    log.info("Downloading %d file(s) → s3://%s/%s/", len(months), bucket, prefix)
+
+    ok_count, skip_count, err_count = 0, 0, 0
 
     for ym in months:
         filename = f"fhvhv_tripdata_{ym}.parquet"
-        dest = OUTPUT_DIR / filename
+        key = f"{prefix}/{filename}"
 
-        if dest.exists():
-            print(f"[skip] {filename} (already exists)")
+        if s3_key_exists(s3_client, bucket, key):
+            log.info("[skip] %s (already in S3)", filename)
+            skip_count += 1
             continue
 
         url = f"{BASE_URL}/{filename}"
-        print(f"[download] {filename}")
+        log.info("[download] %s → s3://%s/%s", filename, bucket, key)
         try:
-            download_file(url, dest)
-            print(f"  -> saved {dest}")
+            total = stream_to_s3(url, s3_client, bucket, key)
+            log.info("  -> uploaded %.1f MB", total / 1e6)
+            ok_count += 1
         except requests.HTTPError as exc:
-            print(f"  [error] {exc}", file=sys.stderr)
-            if dest.exists():
-                dest.unlink()
+            log.error("  HTTP error for %s: %s", filename, exc)
+            err_count += 1
+        except Exception as exc:
+            log.error("  Failed %s: %s", filename, exc)
+            err_count += 1
+
+    log.info(
+        "Done. uploaded=%d  skipped=%d  errors=%d",
+        ok_count, skip_count, err_count,
+    )
+    if err_count:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
