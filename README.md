@@ -1,3 +1,5 @@
+<!-- Projeto de pipelines de dados para NYC TLC Trip Records - mantido por MathEiji -->
+
 # NYC TLC Trip Record Data Pipelines
 
 This repository contains data pipelines and exploration using **New York City Taxi and Limousine Commission (TLC) Trip Record Data**, in particular the **High Volume For-Hire Vehicle (FHVHV)** trip records (e.g. Uber, Lyft).
