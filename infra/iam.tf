@@ -180,13 +180,25 @@ resource "aws_iam_role_policy" "github_actions" {
         Resource = "*"
       },
       {
-        Sid    = "StepFunctions"
+        Sid    = "StepFunctionsExecute"
         Effect = "Allow"
         Action = [
           "states:StartExecution",
-          "states:DescribeExecution",
         ]
         Resource = aws_sfn_state_machine.pipeline.arn
+      },
+      {
+        Sid    = "StepFunctionsReadOnly"
+        Effect = "Allow"
+        Action = [
+          "states:ListStateMachines",
+          "states:DescribeStateMachine",
+          "states:ListExecutions",
+          "states:DescribeExecution",
+          "states:GetExecutionHistory",
+          "states:ListTagsForResource",
+        ]
+        Resource = "*"
       }
     ]
   })
