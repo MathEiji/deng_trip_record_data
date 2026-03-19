@@ -58,6 +58,10 @@ resource "aws_sfn_state_machine" "pipeline" {
             ContainerOverrides = [
               {
                 Name = "build-raw-layer"
+                Environment = [
+                  { "Name" = "START_MONTH", "Value.$" = "$.start_month" },
+                  { "Name" = "END_MONTH", "Value.$" = "$.end_month" },
+                ]
               }
             ]
           }
