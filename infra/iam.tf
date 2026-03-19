@@ -178,6 +178,15 @@ resource "aws_iam_role_policy" "github_actions" {
           "ec2:DescribeSecurityGroups",
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "StepFunctions"
+        Effect = "Allow"
+        Action = [
+          "states:StartExecution",
+          "states:DescribeExecution",
+        ]
+        Resource = aws_sfn_state_machine.pipeline.arn
       }
     ]
   })

@@ -6,10 +6,14 @@ writes them back to S3, and registers every table in the AWS Glue Data
 Catalog so they're immediately queryable from Athena / Spark / Redshift
 Spectrum.
 
+Only the months specified by START_MONTH / END_MONTH are processed.
+
 Designed to run inside an ECS Fargate task.  Configuration is read from
 environment variables:
 
     S3_BUCKET              – S3 bucket for input and output (required)
+    START_MONTH            – first month to process, YYYY-MM (required)
+    END_MONTH              – last  month to process, YYYY-MM (required)
     S3_STAGING_PREFIX      – key prefix for staging parquets (default: "staging")
     S3_RAW_PREFIX          – key prefix for raw output       (default: "raw")
     GLUE_DATABASE          – Glue catalog database name      (default: "trip_record_data")
@@ -98,6 +102,24 @@ DB_PATH = Path("/tmp/_build_raw.duckdb")
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
+def month_range(start: str, end: str) -> list[str]:
+    """Return a list of 'YYYY-MM' strings from *start* to *end* inclusive."""
+    start_dt = datetime.strptime(start, "%Y-%m")
+    end_dt = datetime.strptime(end, "%Y-%m")
+    if start_dt > end_dt:
+        raise ValueError(f"Start {start} is after end {end}")
+
+    months: list[str] = []
+    current = start_dt
+    while current <= end_dt:
+        months.append(current.strftime("%Y-%m"))
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1)
+        else:
+            current = current.replace(month=current.month + 1)
+    return months
+
+
 def _find_reference_dir() -> Path:
     """Locate the reference/ directory (works both in Docker and local dev)."""
     script_dir = Path(__file__).resolve().parent
@@ -128,47 +150,71 @@ def cleanup_duckdb() -> None:
             p.unlink()
 
 
-def staging_glob(bucket: str, prefix: str) -> str:
-    return f"s3://{bucket}/{prefix}/fhvhv_tripdata_*.parquet"
+def staging_s3_paths(
+    bucket: str, prefix: str, months: list[str],
+) -> list[str]:
+    """Build the explicit list of S3 parquet URIs for the given months."""
+    return [
+        f"s3://{bucket}/{prefix}/fhvhv_tripdata_{ym}.parquet"
+        for ym in months
+    ]
+
+
+def staging_paths_sql(paths: list[str]) -> str:
+    """Format a list of S3 URIs into a DuckDB list literal for read_parquet()."""
+    inner = ", ".join(f"'{p}'" for p in paths)
+    return f"[{inner}]"
 
 
 # ── Discovery ────────────────────────────────────────────────────────────
 
-def discover_staging_files(
-    s3_client, bucket: str, prefix: str,
+def verify_staging_files(
+    s3_client, bucket: str, paths: list[str],
 ) -> list[dict]:
-    """List staging parquet files in S3.  Returns [{"Key": ..., "Size": ...}]."""
-    paginator = s3_client.get_paginator("list_objects_v2")
-    files = []
-    for page in paginator.paginate(
-        Bucket=bucket, Prefix=f"{prefix}/fhvhv_tripdata_",
-    ):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
-                files.append({"Key": obj["Key"], "Size": obj["Size"]})
-    if not files:
-        log.error("No staging files found at s3://%s/%s/", bucket, prefix)
+    """HEAD each expected staging file. Returns [{"Key": ..., "Size": ...}].
+
+    Exits with error if any file is missing.
+    """
+    files: list[dict] = []
+    missing: list[str] = []
+
+    for uri in paths:
+        key = uri.split(f"s3://{bucket}/", 1)[1]
+        try:
+            resp = s3_client.head_object(Bucket=bucket, Key=key)
+            files.append({"Key": key, "Size": resp["ContentLength"]})
+        except s3_client.exceptions.ClientError:
+            missing.append(uri)
+
+    if missing:
+        log.error("Staging files not found in S3:")
+        for m in missing:
+            log.error("  %s", m)
         sys.exit(1)
-    return sorted(files, key=lambda x: x["Key"])
+
+    return files
 
 
 # ── Data quality ─────────────────────────────────────────────────────────
 
 def analyze_data_quality(
-    con: duckdb.DuckDBPyConnection, glob: str,
+    con: duckdb.DuckDBPyConnection, paths_lit: str,
 ) -> int:
-    """Profile the staging data and return total row count."""
+    """Profile the staging data and return total row count.
+
+    *paths_lit* is a DuckDB list literal, e.g. ``['s3://…/a.parquet', …]``.
+    """
     log.info("=" * 70)
     log.info("DATA QUALITY ANALYSIS")
     log.info("=" * 70)
 
     schema = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{glob}')"
+        f"DESCRIBE SELECT * FROM read_parquet({paths_lit})"
     ).fetchall()
 
     file_counts = con.execute(f"""
         SELECT filename, count(*) AS n
-        FROM read_parquet('{glob}', filename=true)
+        FROM read_parquet({paths_lit}, filename=true)
         GROUP BY filename ORDER BY filename
     """).fetchall()
 
@@ -183,7 +229,7 @@ def analyze_data_quality(
         for col in schema
     )
     null_result = con.execute(
-        f"SELECT {null_exprs} FROM read_parquet('{glob}')"
+        f"SELECT {null_exprs} FROM read_parquet({paths_lit})"
     ).fetchone()
 
     log.info("Null analysis:")
@@ -209,7 +255,7 @@ def analyze_data_quality(
             for c in numeric_cols
         )
         stats = con.execute(
-            f"SELECT {stat_exprs} FROM read_parquet('{glob}')"
+            f"SELECT {stat_exprs} FROM read_parquet({paths_lit})"
         ).fetchone()
 
         log.info("Numeric column statistics:")
@@ -225,7 +271,7 @@ def analyze_data_quality(
     for col_name in categorical_cols:
         dist = con.execute(f"""
             SELECT "{col_name}", count(*) AS n
-            FROM read_parquet('{glob}')
+            FROM read_parquet({paths_lit})
             WHERE "{col_name}" IS NOT NULL
             GROUP BY "{col_name}"
             ORDER BY n DESC
@@ -245,7 +291,7 @@ def analyze_data_quality(
 
 def build_raw_tables(
     con: duckdb.DuckDBPyConnection,
-    glob: str,
+    paths_lit: str,
     total_rows: int,
     processed_date: str,
     bucket: str,
@@ -253,6 +299,7 @@ def build_raw_tables(
 ) -> dict[str, str]:
     """Materialize staging with trip_id, split into raw tables on S3.
 
+    *paths_lit* is a DuckDB list literal for ``read_parquet()``.
     Returns ``{table_name: s3_parquet_path}``.
     """
     log.info("=" * 70)
@@ -267,7 +314,7 @@ def build_raw_tables(
             (row_number() OVER ()) - 1 AS trip_id,
             '{processed_date}'         AS processed_date,
             *
-        FROM read_parquet('{glob}')
+        FROM read_parquet({paths_lit})
     """)
     log.info("  Done in %.1fs  (%s rows)", time.time() - t0, f"{total_rows:,}")
 
@@ -500,6 +547,8 @@ def main() -> None:
     processed_date = datetime.now().strftime("%Y%m%d")
 
     bucket = os.environ.get("S3_BUCKET")
+    start = os.environ.get("START_MONTH")
+    end = os.environ.get("END_MONTH")
     staging_prefix = os.environ.get("S3_STAGING_PREFIX", "staging").strip("/")
     raw_prefix = os.environ.get("S3_RAW_PREFIX", "raw").strip("/")
     glue_database = os.environ.get("GLUE_DATABASE", "trip_record_data")
@@ -509,21 +558,28 @@ def main() -> None:
     if not bucket:
         log.error("S3_BUCKET is required (set via environment variable)")
         sys.exit(1)
+    if not start or not end:
+        log.error("START_MONTH and END_MONTH are required (set via environment variables)")
+        sys.exit(1)
 
+    months = month_range(start, end)
     s3_client = boto3.client("s3", region_name=region)
     glue_client = boto3.client("glue", region_name=region)
-    glob = staging_glob(bucket, staging_prefix)
+
+    s3_paths = staging_s3_paths(bucket, staging_prefix, months)
+    paths_lit = staging_paths_sql(s3_paths)
 
     log.info("=" * 70)
     log.info("RAW LAYER BUILD")
+    log.info("  Months        : %s → %s (%d file(s))", start, end, len(months))
     log.info("  Staging       : s3://%s/%s/", bucket, staging_prefix)
     log.info("  Output        : s3://%s/%s/", bucket, raw_prefix)
     log.info("  Glue database : %s", glue_database)
     log.info("  Processed date: %s", processed_date)
     log.info("=" * 70)
 
-    files = discover_staging_files(s3_client, bucket, staging_prefix)
-    log.info("%d staging file(s) found:", len(files))
+    files = verify_staging_files(s3_client, bucket, s3_paths)
+    log.info("%d staging file(s) verified:", len(files))
     for f in files:
         size_mb = f["Size"] / (1024 * 1024)
         log.info("  %s  (%.0f MB)", f["Key"], size_mb)
@@ -534,14 +590,14 @@ def main() -> None:
         if skip_qa:
             log.info("Skipping quality analysis (SKIP_QUALITY_ANALYSIS=true)")
             total_rows = con.execute(
-                f"SELECT count(*) FROM read_parquet('{glob}')"
+                f"SELECT count(*) FROM read_parquet({paths_lit})"
             ).fetchone()[0]
             log.info("Total staging rows: %s", f"{total_rows:,}")
         else:
-            total_rows = analyze_data_quality(con, glob)
+            total_rows = analyze_data_quality(con, paths_lit)
 
         raw_paths = build_raw_tables(
-            con, glob, total_rows, processed_date, bucket, raw_prefix,
+            con, paths_lit, total_rows, processed_date, bucket, raw_prefix,
         )
         dim_paths = build_dimension_tables(con, bucket, raw_prefix)
 
@@ -560,6 +616,7 @@ def main() -> None:
     status = "BUILD COMPLETE" if ok else "BUILD COMPLETED WITH WARNINGS"
     log.info(status)
     log.info("  Total time : %.1fs", elapsed)
+    log.info("  Months     : %s → %s", start, end)
     log.info("  Total rows : %s", f"{total_rows:,}")
     log.info("  Raw tables : %d", len(RAW_TABLE_COLUMNS))
     log.info("  Dimensions : %d", len(dim_paths))

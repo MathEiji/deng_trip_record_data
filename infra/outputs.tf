@@ -33,6 +33,11 @@ output "subnet_ids" {
   value       = join(",", data.aws_subnets.default.ids)
 }
 
+output "state_machine_arn" {
+  description = "Step Functions state machine ARN (set as STATE_MACHINE_ARN secret)"
+  value       = aws_sfn_state_machine.pipeline.arn
+}
+
 output "iam_user_passwords" {
   description = "Initial passwords for developer IAM users (terraform output -json iam_user_passwords)"
   value       = { for k, v in aws_iam_user_login_profile.developers : k => v.password }

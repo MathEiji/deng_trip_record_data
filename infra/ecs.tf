@@ -75,6 +75,8 @@ resource "aws_ecs_task_definition" "build_raw_layer" {
         { name = "S3_BUCKET", value = var.s3_bucket_name },
         { name = "S3_STAGING_PREFIX", value = "staging" },
         { name = "S3_RAW_PREFIX", value = "raw" },
+        { name = "START_MONTH", value = var.start_month },
+        { name = "END_MONTH", value = var.end_month },
         { name = "GLUE_DATABASE", value = var.glue_database },
         { name = "AWS_REGION", value = var.aws_region },
       ]
