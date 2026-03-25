@@ -28,7 +28,9 @@ deng_trip_record_data/
 │   └── src/
 │       ├── download_trip_data.py   # Download FHVHV parquets from the TLC CDN
 │       ├── build_raw_layer.py      # Build raw tables from staging data
-│       └── requirements.txt        # App dependencies (requests, duckdb)
+│       ├── build_trusted_layer.py  # Build trusted_trips from raw tables
+│       ├── build_specialized_layer.py # Build aggregated tables from trusted
+│       └── requirements.txt        # App dependencies (requests, duckdb, boto3)
 ├── infra/                          # Terraform (ECS Fargate + ECR + S3 + IAM)
 │   ├── main.tf
 │   ├── variables.tf
@@ -40,7 +42,9 @@ deng_trip_record_data/
 │   └── cloudwatch.tf
 ├── data/
 │   ├── staging/                    # Downloaded parquet files (git-ignored)
-│   └── raw/                        # Context-based raw tables (git-ignored)
+│   ├── raw/                        # Context-based raw tables (git-ignored)
+│   ├── trusted/                    # Denormalized, cleaned trip data (git-ignored)
+│   └── specialized/                # Pre-aggregated analytical tables (git-ignored)
 ├── reference/                      # Dimension CSVs (version-controlled)
 │   ├── dim_hvfhs_license.csv       # HVFHS license → company mapping
 │   └── dim_base.csv                # TLC base number → company mapping
@@ -107,6 +111,53 @@ Reference/lookup tables stored as CSVs in `reference/` and converted to parquet 
 | **dim_base** | TLC base number → company | `base_number`, `base_name`, `parent_company`, `base_type` |
 
 See `notebooks/raw_tables_exploration.ipynb` for schema inspection, sampling, and optional code to write these tables to Parquet.
+
+---
+
+## Trusted layer
+
+The trusted layer denormalizes, cleans, and enriches the raw tables into a single `trusted_trips` table. Build it after the raw layer:
+
+```bash
+python app/src/build_trusted_layer.py
+```
+
+Env vars: `S3_BUCKET`, `START_MONTH`, `END_MONTH`, `S3_RAW_PREFIX` (default `raw`), `S3_TRUSTED_PREFIX` (default `trusted`), `GLUE_DATABASE`, `AWS_REGION`.
+
+**What it does:**
+1. Joins all 4 raw tables + `dim_hvfhs_license` on `trip_id` / `year_month`
+2. Applies quality filters (positive fare/distance, caps on outliers, temporal consistency)
+3. Computes derived fields (pickup hour, day of week, wait time, trip duration, total fare, fare per mile)
+4. Writes Hive-partitioned parquet to S3 and registers in Glue
+
+| Column group | Fields |
+|---|---|
+| **Identity** | `trip_id`, `year_month`, `processed_date` |
+| **Provider** | `company_name`, `hvfhs_license_num` |
+| **Timing** | `request_datetime`, `pickup_datetime`, `dropoff_datetime` |
+| **Derived time** | `pickup_date`, `pickup_hour`, `pickup_day_of_week`, `pickup_day_name`, `wait_time_seconds`, `trip_duration_seconds` |
+| **Distance** | `trip_miles`, `trip_time_seconds`, `pickup_location_id`, `dropoff_location_id` |
+| **Fare** | `base_passenger_fare`, `tolls`, `congestion_surcharge`, `airport_fee`, `tips`, `driver_pay`, `total_fare`, `fare_per_mile` |
+| **Flags** | `is_shared_request`, `is_shared_match`, `is_wav_match` |
+
+---
+
+## Specialized layer
+
+The specialized layer pre-aggregates `trusted_trips` into four tables, one per business question:
+
+```bash
+python app/src/build_specialized_layer.py
+```
+
+Env vars: `S3_BUCKET`, `START_MONTH`, `END_MONTH`, `S3_TRUSTED_PREFIX` (default `trusted`), `S3_SPECIALIZED_PREFIX` (default `specialized`), `GLUE_DATABASE`, `AWS_REGION`.
+
+| Table | Question | Grain |
+|---|---|---|
+| **spec_hourly_volume** | Q1: Peak hours of day | `year_month` x `company_name` x `pickup_hour` |
+| **spec_daily_volume** | Q2: Peak days of week | `year_month` x `company_name` x `pickup_day_of_week` |
+| **spec_trip_distance** | Q3: Average distance | `year_month` x `company_name` |
+| **spec_distance_fare** | Q4: Distance vs fare | `year_month` x `company_name` x `distance_bucket` |
 
 ---
 

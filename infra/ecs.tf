@@ -93,6 +93,100 @@ resource "aws_ecs_task_definition" "build_raw_layer" {
   ])
 }
 
+resource "aws_ecs_task_definition" "build_trusted_layer" {
+  family                   = "${var.project_name}-build-trusted"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "1024"
+  memory                   = "4096"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+  task_role_arn            = aws_iam_role.ecs_task.arn
+
+  ephemeral_storage {
+    size_in_gib = 20
+  }
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  container_definitions = jsonencode([
+    {
+      name      = "build-trusted-layer"
+      image     = "${aws_ecr_repository.app.repository_url}:latest"
+      essential = true
+      command   = ["src/build_trusted_layer.py"]
+
+      environment = [
+        { name = "S3_BUCKET", value = var.s3_bucket_name },
+        { name = "S3_RAW_PREFIX", value = "raw" },
+        { name = "S3_TRUSTED_PREFIX", value = "trusted" },
+        { name = "START_MONTH", value = var.start_month },
+        { name = "END_MONTH", value = var.end_month },
+        { name = "GLUE_DATABASE", value = var.glue_database },
+        { name = "AWS_REGION", value = var.aws_region },
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
+          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-stream-prefix" = "build-trusted"
+        }
+      }
+    }
+  ])
+}
+
+resource "aws_ecs_task_definition" "build_specialized_layer" {
+  family                   = "${var.project_name}-build-specialized"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "1024"
+  memory                   = "4096"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+  task_role_arn            = aws_iam_role.ecs_task.arn
+
+  ephemeral_storage {
+    size_in_gib = 20
+  }
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  container_definitions = jsonencode([
+    {
+      name      = "build-specialized-layer"
+      image     = "${aws_ecr_repository.app.repository_url}:latest"
+      essential = true
+      command   = ["src/build_specialized_layer.py"]
+
+      environment = [
+        { name = "S3_BUCKET", value = var.s3_bucket_name },
+        { name = "S3_TRUSTED_PREFIX", value = "trusted" },
+        { name = "S3_SPECIALIZED_PREFIX", value = "specialized" },
+        { name = "START_MONTH", value = var.start_month },
+        { name = "END_MONTH", value = var.end_month },
+        { name = "GLUE_DATABASE", value = var.glue_database },
+        { name = "AWS_REGION", value = var.aws_region },
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
+          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-stream-prefix" = "build-specialized"
+        }
+      }
+    }
+  ])
+}
+
 resource "aws_security_group" "ecs_task" {
   name_prefix = "${var.project_name}-ecs-"
   description = "Allow outbound internet access for ECS Fargate tasks"

@@ -31,8 +31,7 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: trip-record-data
   ECS_CLUSTER: trip-record-data
-  DOWNLOAD_TASK_FAMILY: trip-record-data-download
-  BUILD_RAW_TASK_FAMILY: trip-record-data-build-raw
+  TASK_FAMILIES: trip-record-data-download trip-record-data-build-raw trip-record-data-build-trusted trip-record-data-build-specialized
   STATE_MACHINE_ARN: ${{ secrets.STATE_MACHINE_ARN }}
 
 jobs:
@@ -91,7 +90,7 @@ jobs:
         env:
           NEW_IMAGE: ${{ needs.build-and-push.outputs.image }}
         run: |
-          for FAMILY in "${DOWNLOAD_TASK_FAMILY}" "${BUILD_RAW_TASK_FAMILY}"; do
+          for FAMILY in ${TASK_FAMILIES}; do
             echo "Updating task definition: ${FAMILY}"
 
             TASK_DEF=$(aws ecs describe-task-definition \
