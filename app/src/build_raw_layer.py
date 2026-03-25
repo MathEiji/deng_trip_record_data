@@ -546,7 +546,7 @@ def _register_glue_partitions(
         for ym in year_months
     ]
 
-    created = 0
+    created, updated = 0, 0
     for i in range(0, len(partition_inputs), 100):
         batch = partition_inputs[i : i + 100]
         resp = glue_client.batch_create_partition(
@@ -556,14 +556,36 @@ def _register_glue_partitions(
         )
         errors = resp.get("Errors", [])
         created += len(batch) - len(errors)
+
+        to_update = []
         for err in errors:
             code = err["ErrorDetail"]["ErrorCode"]
-            if code != "AlreadyExistsException":
+            if code == "AlreadyExistsException":
+                vals = err["PartitionValues"]
+                matching = [p for p in batch if p["Values"] == vals]
+                if matching:
+                    to_update.append(matching[0])
+            else:
                 log.warning(
                     "  Partition %s error: %s",
                     err["PartitionValues"], err["ErrorDetail"]["ErrorMessage"],
                 )
-    return created
+
+        if to_update:
+            glue_client.batch_update_partition(
+                DatabaseName=database,
+                TableName=table_name,
+                Entries=[
+                    {
+                        "PartitionValueList": p["Values"],
+                        "PartitionInput": p,
+                    }
+                    for p in to_update
+                ],
+            )
+            updated += len(to_update)
+
+    return created + updated
 
 
 def register_glue_tables(

@@ -79,6 +79,7 @@ resource "aws_iam_role_policy" "ecs_task_glue" {
           "glue:DeleteTable",
           "glue:GetPartitions",
           "glue:BatchCreatePartition",
+          "glue:BatchUpdatePartition",
         ]
         Resource = [
           "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:catalog",
