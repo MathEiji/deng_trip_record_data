@@ -293,14 +293,15 @@ def build_raw_tables(
     con: duckdb.DuckDBPyConnection,
     paths_lit: str,
     total_rows: int,
-    processed_date: str,
     bucket: str,
     raw_prefix: str,
 ) -> dict[str, str]:
     """Materialize staging with trip_id, split into raw tables on S3.
 
     *paths_lit* is a DuckDB list literal for ``read_parquet()``.
-    Returns ``{table_name: s3_parquet_path}``.
+    Output is Hive-partitioned by ``year_month`` (yyyyMM derived from the
+    staging filename suffix).
+    Returns ``{table_name: s3_base_directory}``.
     """
     log.info("=" * 70)
     log.info("BUILDING RAW LAYER")
@@ -312,9 +313,13 @@ def build_raw_tables(
         CREATE OR REPLACE TABLE staging_full AS
         SELECT
             (row_number() OVER ()) - 1 AS trip_id,
-            '{processed_date}'         AS processed_date,
-            *
-        FROM read_parquet({paths_lit})
+            current_timestamp AS processed_date,
+            CAST(replace(
+                regexp_extract(filename, 'fhvhv_tripdata_(\d{{4}}-\d{{2}})', 1),
+                '-', ''
+            ) AS INTEGER) AS year_month,
+            * EXCLUDE (filename)
+        FROM read_parquet({paths_lit}, filename=true)
     """)
     log.info("  Done in %.1fs  (%s rows)", time.time() - t0, f"{total_rows:,}")
 
@@ -322,17 +327,17 @@ def build_raw_tables(
     for table_name, columns in RAW_TABLE_COLUMNS.items():
         t0 = time.time()
         cols_csv = ", ".join(f'"{c}"' for c in columns)
-        s3_path = f"s3://{bucket}/{raw_prefix}/{table_name}/{table_name}.parquet"
+        s3_dir = f"s3://{bucket}/{raw_prefix}/{table_name}"
 
         con.execute(f"""
             COPY (
-                SELECT trip_id, processed_date, {cols_csv}
+                SELECT trip_id, processed_date, year_month, {cols_csv}
                 FROM staging_full
-            ) TO '{s3_path}' (FORMAT PARQUET)
+            ) TO '{s3_dir}' (FORMAT PARQUET, PARTITION_BY (year_month), OVERWRITE_OR_IGNORE)
         """)
         elapsed = time.time() - t0
-        log.info("  %-30s -> %s  (%.1fs)", table_name, s3_path, elapsed)
-        table_paths[table_name] = s3_path
+        log.info("  %-30s -> %s/  (%.1fs)", table_name, s3_dir, elapsed)
+        table_paths[table_name] = s3_dir
 
     con.execute("DROP TABLE IF EXISTS staging_full")
     return table_paths
@@ -389,10 +394,13 @@ def validate_raw_layer(
 
     all_ok = True
 
+    def _raw_glob(s3_dir: str) -> str:
+        return f"{s3_dir}/**/*.parquet"
+
     for table_name in RAW_TABLE_COLUMNS:
-        s3_path = table_paths[table_name]
+        s3_dir = table_paths[table_name]
         n = con.execute(
-            f"SELECT count(*) FROM read_parquet('{s3_path}')"
+            f"SELECT count(*) FROM read_parquet('{_raw_glob(s3_dir)}', hive_partitioning=true)"
         ).fetchone()[0]
         ok = n == total_rows
         if not ok:
@@ -413,15 +421,15 @@ def validate_raw_layer(
 
     # Join consistency on a sample
     sample = min(100_000, total_rows)
-    rp = {name: table_paths[name] for name in RAW_TABLE_COLUMNS}
+    rp = {name: _raw_glob(table_paths[name]) for name in RAW_TABLE_COLUMNS}
     joined = con.execute(f"""
         SELECT count(*)
-        FROM read_parquet('{rp["raw_dispatch_base"]}') d
-        JOIN read_parquet('{rp["raw_trip_time_location"]}') t
+        FROM read_parquet('{rp["raw_dispatch_base"]}', hive_partitioning=true) d
+        JOIN read_parquet('{rp["raw_trip_time_location"]}', hive_partitioning=true) t
              ON d.trip_id = t.trip_id
-        JOIN read_parquet('{rp["raw_fare_payment"]}') f
+        JOIN read_parquet('{rp["raw_fare_payment"]}', hive_partitioning=true) f
              ON d.trip_id = f.trip_id
-        JOIN read_parquet('{rp["raw_request_flags"]}') r
+        JOIN read_parquet('{rp["raw_request_flags"]}', hive_partitioning=true) r
              ON d.trip_id = r.trip_id
         WHERE d.trip_id < {sample}
     """).fetchone()[0]
@@ -439,19 +447,43 @@ def validate_raw_layer(
 
 # ── Glue Data Catalog ────────────────────────────────────────────────────
 
+_PARQUET_SERDE = {
+    "InputFormat": (
+        "org.apache.hadoop.hive.ql.io.parquet"
+        ".MapredParquetInputFormat"
+    ),
+    "OutputFormat": (
+        "org.apache.hadoop.hive.ql.io.parquet"
+        ".MapredParquetOutputFormat"
+    ),
+    "SerdeInfo": {
+        "SerializationLibrary": (
+            "org.apache.hadoop.hive.ql.io.parquet"
+            ".serde.ParquetHiveSerDe"
+        ),
+    },
+}
+
+
 def _glue_columns_from_parquet(
-    con: duckdb.DuckDBPyConnection, s3_path: str,
+    con: duckdb.DuckDBPyConnection,
+    s3_path: str,
+    hive_partitioning: bool = False,
+    exclude: set[str] | None = None,
 ) -> list[dict]:
-    """Derive Glue-compatible column definitions from an S3 parquet file."""
+    """Derive Glue-compatible column definitions from S3 parquet file(s)."""
+    hp = ", hive_partitioning=true" if hive_partitioning else ""
     schema = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{s3_path}')"
+        f"DESCRIBE SELECT * FROM read_parquet('{s3_path}'{hp})"
     ).fetchall()
+    excl = exclude or set()
     return [
         {
             "Name": col_name,
             "Type": DUCKDB_TO_GLUE_TYPE.get(col_type, "string"),
         }
         for col_name, col_type, *_ in schema
+        if col_name not in excl
     ]
 
 
@@ -461,6 +493,7 @@ def _upsert_glue_table(
     table_name: str,
     s3_location: str,
     columns: list[dict],
+    partition_keys: list[dict] | None = None,
 ) -> str:
     """Create or update a single Glue table. Returns 'created' or 'updated'."""
     table_input = {
@@ -469,20 +502,7 @@ def _upsert_glue_table(
         "StorageDescriptor": {
             "Columns": columns,
             "Location": s3_location,
-            "InputFormat": (
-                "org.apache.hadoop.hive.ql.io.parquet"
-                ".MapredParquetInputFormat"
-            ),
-            "OutputFormat": (
-                "org.apache.hadoop.hive.ql.io.parquet"
-                ".MapredParquetOutputFormat"
-            ),
-            "SerdeInfo": {
-                "SerializationLibrary": (
-                    "org.apache.hadoop.hive.ql.io.parquet"
-                    ".serde.ParquetHiveSerDe"
-                ),
-            },
+            **_PARQUET_SERDE,
         },
         "TableType": "EXTERNAL_TABLE",
         "Parameters": {
@@ -490,6 +510,8 @@ def _upsert_glue_table(
             "typeOfData": "file",
         },
     }
+    if partition_keys:
+        table_input["PartitionKeys"] = partition_keys
 
     try:
         glue_client.update_table(
@@ -503,6 +525,47 @@ def _upsert_glue_table(
         return "created"
 
 
+def _register_glue_partitions(
+    glue_client,
+    database: str,
+    table_name: str,
+    s3_location: str,
+    columns: list[dict],
+    year_months: list[int],
+) -> int:
+    """Register Hive-style partitions in Glue. Returns count of new partitions."""
+    partition_inputs = [
+        {
+            "Values": [str(ym)],
+            "StorageDescriptor": {
+                "Columns": columns,
+                "Location": f"{s3_location}year_month={ym}/",
+                **_PARQUET_SERDE,
+            },
+        }
+        for ym in year_months
+    ]
+
+    created = 0
+    for i in range(0, len(partition_inputs), 100):
+        batch = partition_inputs[i : i + 100]
+        resp = glue_client.batch_create_partition(
+            DatabaseName=database,
+            TableName=table_name,
+            PartitionInputList=batch,
+        )
+        errors = resp.get("Errors", [])
+        created += len(batch) - len(errors)
+        for err in errors:
+            code = err["ErrorDetail"]["ErrorCode"]
+            if code != "AlreadyExistsException":
+                log.warning(
+                    "  Partition %s error: %s",
+                    err["PartitionValues"], err["ErrorDetail"]["ErrorMessage"],
+                )
+    return created
+
+
 def register_glue_tables(
     con: duckdb.DuckDBPyConnection,
     glue_client,
@@ -510,6 +573,7 @@ def register_glue_tables(
     table_paths: dict[str, str],
     bucket: str,
     raw_prefix: str,
+    year_months: list[int],
 ) -> None:
     """Register all raw and dimension tables in the Glue Data Catalog."""
     log.info("=" * 70)
@@ -528,23 +592,44 @@ def register_glue_tables(
         log.info("Glue database exists: %s", database)
 
     for table_name, s3_path in table_paths.items():
-        columns = _glue_columns_from_parquet(con, s3_path)
+        is_raw = table_name in RAW_TABLE_COLUMNS
         s3_location = f"s3://{bucket}/{raw_prefix}/{table_name}/"
 
+        if is_raw:
+            glob_path = f"{s3_path}/**/*.parquet"
+            columns = _glue_columns_from_parquet(
+                con, glob_path,
+                hive_partitioning=True,
+                exclude={"year_month"},
+            )
+            partition_keys = [{"Name": "year_month", "Type": "int"}]
+        else:
+            columns = _glue_columns_from_parquet(con, s3_path)
+            partition_keys = None
+
         action = _upsert_glue_table(
-            glue_client, database, table_name, s3_location, columns,
+            glue_client, database, table_name, s3_location,
+            columns, partition_keys,
         )
         log.info(
             "  [%s] %s.%-25s (%d cols) -> %s",
             action, database, table_name, len(columns), s3_location,
         )
 
+        if is_raw and year_months:
+            n_parts = _register_glue_partitions(
+                glue_client, database, table_name,
+                s3_location, columns, year_months,
+            )
+            log.info(
+                "         %d new partition(s) registered", n_parts,
+            )
+
 
 # ── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
     t_start = time.time()
-    processed_date = datetime.now().strftime("%Y%m%d")
 
     bucket = os.environ.get("S3_BUCKET")
     start = os.environ.get("START_MONTH")
@@ -563,6 +648,7 @@ def main() -> None:
         sys.exit(1)
 
     months = month_range(start, end)
+    year_months = [int(ym.replace("-", "")) for ym in months]
     s3_client = boto3.client("s3", region_name=region)
     glue_client = boto3.client("glue", region_name=region)
 
@@ -572,10 +658,10 @@ def main() -> None:
     log.info("=" * 70)
     log.info("RAW LAYER BUILD")
     log.info("  Months        : %s → %s (%d file(s))", start, end, len(months))
+    log.info("  Partitions    : %s", ", ".join(str(ym) for ym in year_months))
     log.info("  Staging       : s3://%s/%s/", bucket, staging_prefix)
     log.info("  Output        : s3://%s/%s/", bucket, raw_prefix)
     log.info("  Glue database : %s", glue_database)
-    log.info("  Processed date: %s", processed_date)
     log.info("=" * 70)
 
     files = verify_staging_files(s3_client, bucket, s3_paths)
@@ -597,7 +683,7 @@ def main() -> None:
             total_rows = analyze_data_quality(con, paths_lit)
 
         raw_paths = build_raw_tables(
-            con, paths_lit, total_rows, processed_date, bucket, raw_prefix,
+            con, paths_lit, total_rows, bucket, raw_prefix,
         )
         dim_paths = build_dimension_tables(con, bucket, raw_prefix)
 
@@ -605,7 +691,8 @@ def main() -> None:
         ok = validate_raw_layer(con, total_rows, all_paths)
 
         register_glue_tables(
-            con, glue_client, glue_database, all_paths, bucket, raw_prefix,
+            con, glue_client, glue_database, all_paths,
+            bucket, raw_prefix, year_months,
         )
     finally:
         con.close()
