@@ -78,6 +78,9 @@ resource "aws_iam_role_policy" "ecs_task_glue" {
           "glue:UpdateTable",
           "glue:DeleteTable",
           "glue:GetPartitions",
+          "glue:GetPartition",
+          "glue:CreatePartition",
+          "glue:UpdatePartition",
           "glue:BatchCreatePartition",
           "glue:BatchUpdatePartition",
         ]
