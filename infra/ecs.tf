@@ -103,7 +103,7 @@ resource "aws_ecs_task_definition" "build_trusted_layer" {
   task_role_arn            = aws_iam_role.ecs_task.arn
 
   ephemeral_storage {
-    size_in_gib = 20
+    size_in_gib = 21
   }
 
   runtime_platform {
@@ -150,7 +150,7 @@ resource "aws_ecs_task_definition" "build_specialized_layer" {
   task_role_arn            = aws_iam_role.ecs_task.arn
 
   ephemeral_storage {
-    size_in_gib = 20
+    size_in_gib = 21
   }
 
   runtime_platform {
