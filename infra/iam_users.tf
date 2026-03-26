@@ -60,10 +60,27 @@ resource "aws_iam_group_policy" "developers" {
         Sid    = "ECS"
         Effect = "Allow"
         Action = [
+          "ecs:DescribeClusters",
+          "ecs:ListClusters",
           "ecs:DescribeTaskDefinition",
+          "ecs:ListTaskDefinitions",
           "ecs:DescribeTasks",
           "ecs:ListTasks",
+          "ecs:DescribeServices",
+          "ecs:ListServices",
           "ecs:RunTask",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "StepFunctions"
+        Effect = "Allow"
+        Action = [
+          "states:ListStateMachines",
+          "states:DescribeStateMachine",
+          "states:ListExecutions",
+          "states:DescribeExecution",
+          "states:GetExecutionHistory",
         ]
         Resource = "*"
       },
