@@ -158,6 +158,7 @@ def init_duckdb(region: str) -> duckdb.DuckDBPyConnection:
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("INSTALL aws; LOAD aws;")
     con.execute(f"SET s3_region = '{region}';")
+    con.execute("SET memory_limit = '3GB';")
     con.execute("CREATE SECRET (TYPE S3, PROVIDER CREDENTIAL_CHAIN);")
     return con
 
