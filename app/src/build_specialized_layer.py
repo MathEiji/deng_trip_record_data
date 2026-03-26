@@ -8,8 +8,8 @@ designed to answer specific business questions:
     spec_trip_distance  – distance distribution stats  (Q3)
     spec_distance_fare  – distance ↔ fare relationship (Q4)
 
-Each table is written as a single (non-partitioned) parquet file to S3
-and registered in the AWS Glue Data Catalog.
+Each table is Hive-partitioned by ``year_month`` (yyyyMM integer) and
+registered in the AWS Glue Data Catalog.
 
 Configuration via environment variables:
 
@@ -215,9 +215,9 @@ def build_specialized_tables(
     bucket: str,
     spec_prefix: str,
 ) -> dict[str, str]:
-    """Run each aggregation query and write to S3.
+    """Run each aggregation query and write partitioned output to S3.
 
-    Returns ``{table_name: s3_parquet_path}``.
+    Returns ``{table_name: s3_base_directory}``.
     """
     log.info("=" * 70)
     log.info("BUILDING SPECIALIZED LAYER")
@@ -227,25 +227,24 @@ def build_specialized_tables(
 
     for table_name, (description, sql) in SPECIALIZED_TABLES.items():
         t0 = time.time()
-        s3_path = (
-            f"s3://{bucket}/{spec_prefix}/{table_name}/{table_name}.parquet"
-        )
+        s3_dir = f"s3://{bucket}/{spec_prefix}/{table_name}"
 
         con.execute(f"""
             COPY (
                 {sql}
-            ) TO '{s3_path}' (FORMAT PARQUET)
+            ) TO '{s3_dir}' (FORMAT PARQUET, PARTITION_BY (year_month), OVERWRITE_OR_IGNORE)
         """)
 
+        glob = f"{s3_dir}/**/*.parquet"
         n = con.execute(
-            f"SELECT count(*) FROM read_parquet('{s3_path}')"
+            f"SELECT count(*) FROM read_parquet('{glob}', hive_partitioning=true)"
         ).fetchone()[0]
         elapsed = time.time() - t0
         log.info(
             "  %-25s %6s rows  (%.1fs)  %s",
             table_name, f"{n:,}", elapsed, description,
         )
-        table_paths[table_name] = s3_path
+        table_paths[table_name] = s3_dir
 
     return table_paths
 
@@ -264,9 +263,12 @@ def validate_specialized(
 
     all_ok = True
 
-    for table_name, s3_path in table_paths.items():
+    def _glob(s3_dir: str) -> str:
+        return f"{s3_dir}/**/*.parquet"
+
+    for table_name, s3_dir in table_paths.items():
         n = con.execute(
-            f"SELECT count(*) FROM read_parquet('{s3_path}')"
+            f"SELECT count(*) FROM read_parquet('{_glob(s3_dir)}', hive_partitioning=true)"
         ).fetchone()[0]
         ok = n > 0
         if not ok:
@@ -275,7 +277,7 @@ def validate_specialized(
 
     hourly_sum = con.execute(f"""
         SELECT SUM(trip_count)
-        FROM read_parquet('{table_paths["spec_hourly_volume"]}')
+        FROM read_parquet('{_glob(table_paths["spec_hourly_volume"])}', hive_partitioning=true)
     """).fetchone()[0]
     ok = hourly_sum == trusted_count
     if not ok:
@@ -287,7 +289,7 @@ def validate_specialized(
 
     daily_sum = con.execute(f"""
         SELECT SUM(trip_count)
-        FROM read_parquet('{table_paths["spec_daily_volume"]}')
+        FROM read_parquet('{_glob(table_paths["spec_daily_volume"])}', hive_partitioning=true)
     """).fetchone()[0]
     ok = daily_sum == trusted_count
     if not ok:
@@ -304,17 +306,23 @@ def validate_specialized(
 
 def _glue_columns_from_parquet(
     con: duckdb.DuckDBPyConnection,
-    s3_path: str,
+    s3_glob: str,
+    *,
+    hive_partitioning: bool = False,
+    exclude: set[str] | None = None,
 ) -> list[dict]:
+    hp = ", hive_partitioning=true" if hive_partitioning else ""
     schema = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{s3_path}')"
+        f"DESCRIBE SELECT * FROM read_parquet('{s3_glob}'{hp})"
     ).fetchall()
+    skip = exclude or set()
     return [
         {
             "Name": col_name,
             "Type": DUCKDB_TO_GLUE_TYPE.get(col_type, "string"),
         }
         for col_name, col_type, *_ in schema
+        if col_name not in skip
     ]
 
 
@@ -325,8 +333,9 @@ def _upsert_glue_table(
     s3_location: str,
     columns: list[dict],
     description: str = "",
+    partition_keys: list[dict] | None = None,
 ) -> str:
-    table_input = {
+    table_input: dict = {
         "Name": table_name,
         "Description": description or f"Specialized layer: {table_name}",
         "StorageDescriptor": {
@@ -340,6 +349,8 @@ def _upsert_glue_table(
             "typeOfData": "file",
         },
     }
+    if partition_keys:
+        table_input["PartitionKeys"] = partition_keys
     try:
         glue_client.update_table(
             DatabaseName=database, TableInput=table_input,
@@ -352,6 +363,56 @@ def _upsert_glue_table(
         return "created"
 
 
+def _register_glue_partitions(
+    glue_client,
+    database: str,
+    table_name: str,
+    s3_location: str,
+    columns: list[dict],
+    year_months: list[int],
+) -> int:
+    """Create or update Glue partitions for each year_month value."""
+    existing: set[tuple] = set()
+    paginator = glue_client.get_paginator("get_partitions")
+    for page in paginator.paginate(DatabaseName=database, TableName=table_name):
+        for p in page.get("Partitions", []):
+            existing.add(tuple(p["Values"]))
+
+    to_create: list[dict] = []
+    to_update: list[dict] = []
+    for ym in year_months:
+        part_input = {
+            "Values": [str(ym)],
+            "StorageDescriptor": {
+                "Columns": columns,
+                "Location": f"{s3_location}year_month={ym}/",
+                **_PARQUET_SERDE,
+            },
+        }
+        if (str(ym),) in existing:
+            to_update.append({"PartitionValueList": [str(ym)], "PartitionInput": part_input})
+        else:
+            to_create.append(part_input)
+
+    batch = 100
+    if to_create:
+        for i in range(0, len(to_create), batch):
+            glue_client.batch_create_partition(
+                DatabaseName=database,
+                TableName=table_name,
+                PartitionInputList=to_create[i : i + batch],
+            )
+    if to_update:
+        for i in range(0, len(to_update), batch):
+            glue_client.batch_update_partition(
+                DatabaseName=database,
+                TableName=table_name,
+                Entries=to_update[i : i + batch],
+            )
+
+    return len(to_create) + len(to_update)
+
+
 def register_specialized_tables(
     con: duckdb.DuckDBPyConnection,
     glue_client,
@@ -359,6 +420,7 @@ def register_specialized_tables(
     table_paths: dict[str, str],
     bucket: str,
     spec_prefix: str,
+    year_months: list[int],
 ) -> None:
     log.info("=" * 70)
     log.info("GLUE DATA CATALOG REGISTRATION")
@@ -375,19 +437,31 @@ def register_specialized_tables(
     except glue_client.exceptions.AlreadyExistsException:
         log.info("Glue database exists: %s", database)
 
-    for table_name, s3_path in table_paths.items():
+    partition_keys = [{"Name": "year_month", "Type": "int"}]
+
+    for table_name, s3_dir in table_paths.items():
         description = SPECIALIZED_TABLES[table_name][0]
         s3_location = f"s3://{bucket}/{spec_prefix}/{table_name}/"
-        columns = _glue_columns_from_parquet(con, s3_path)
+        s3_glob = f"{s3_dir}/**/*.parquet"
+        columns = _glue_columns_from_parquet(
+            con, s3_glob, hive_partitioning=True, exclude={"year_month"},
+        )
 
         action = _upsert_glue_table(
             glue_client, database, table_name,
             s3_location, columns, description,
+            partition_keys=partition_keys,
         )
         log.info(
             "  [%s] %s.%-25s (%d cols) -> %s",
             action, database, table_name, len(columns), s3_location,
         )
+
+        n_parts = _register_glue_partitions(
+            glue_client, database, table_name,
+            s3_location, columns, year_months,
+        )
+        log.info("    %d partition(s) registered", n_parts)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────
@@ -438,6 +512,7 @@ def main() -> None:
         register_specialized_tables(
             con, glue_client, glue_database,
             table_paths, bucket, spec_prefix,
+            year_months,
         )
     finally:
         con.close()
