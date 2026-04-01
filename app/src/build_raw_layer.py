@@ -315,7 +315,7 @@ def build_raw_tables(
             (row_number() OVER ()) - 1 AS trip_id,
             current_timestamp AS processed_date,
             CAST(replace(
-                regexp_extract(filename, 'fhvhv_tripdata_(\d{{4}}-\d{{2}})', 1),
+                regexp_extract(filename, 'fhvhv_tripdata_(\\d{{4}}-\\d{{2}})', 1),
                 '-', ''
             ) AS INTEGER) AS year_month,
             * EXCLUDE (filename)
@@ -386,22 +386,26 @@ def validate_raw_layer(
     con: duckdb.DuckDBPyConnection,
     total_rows: int,
     table_paths: dict[str, str],
+    year_months: list[int],
 ) -> bool:
-    """Check row counts and join consistency across raw tables in S3."""
+    """Check row counts and join consistency for the processed partitions."""
     log.info("=" * 70)
     log.info("VALIDATION")
     log.info("=" * 70)
 
     all_ok = True
+    ym_csv = ", ".join(str(ym) for ym in year_months)
 
     def _raw_glob(s3_dir: str) -> str:
         return f"{s3_dir}/**/*.parquet"
 
     for table_name in RAW_TABLE_COLUMNS:
         s3_dir = table_paths[table_name]
-        n = con.execute(
-            f"SELECT count(*) FROM read_parquet('{_raw_glob(s3_dir)}', hive_partitioning=true)"
-        ).fetchone()[0]
+        n = con.execute(f"""
+            SELECT count(*)
+            FROM read_parquet('{_raw_glob(s3_dir)}', hive_partitioning=true)
+            WHERE year_month IN ({ym_csv})
+        """).fetchone()[0]
         ok = n == total_rows
         if not ok:
             all_ok = False
@@ -419,19 +423,19 @@ def validate_raw_layer(
                 all_ok = False
             log.info("  [%s] %-30s %14s rows", tag, dim_name, f"{n:,}")
 
-    # Join consistency on a sample
     sample = min(100_000, total_rows)
     rp = {name: _raw_glob(table_paths[name]) for name in RAW_TABLE_COLUMNS}
     joined = con.execute(f"""
         SELECT count(*)
         FROM read_parquet('{rp["raw_dispatch_base"]}', hive_partitioning=true) d
         JOIN read_parquet('{rp["raw_trip_time_location"]}', hive_partitioning=true) t
-             ON d.trip_id = t.trip_id
+             ON d.trip_id = t.trip_id AND d.year_month = t.year_month
         JOIN read_parquet('{rp["raw_fare_payment"]}', hive_partitioning=true) f
-             ON d.trip_id = f.trip_id
+             ON d.trip_id = f.trip_id AND d.year_month = f.year_month
         JOIN read_parquet('{rp["raw_request_flags"]}', hive_partitioning=true) r
-             ON d.trip_id = r.trip_id
-        WHERE d.trip_id < {sample}
+             ON d.trip_id = r.trip_id AND d.year_month = r.year_month
+        WHERE d.year_month IN ({ym_csv})
+          AND d.trip_id < {sample}
     """).fetchone()[0]
     ok = joined == sample
     if not ok:
@@ -710,7 +714,7 @@ def main() -> None:
         dim_paths = build_dimension_tables(con, bucket, raw_prefix)
 
         all_paths = {**raw_paths, **dim_paths}
-        ok = validate_raw_layer(con, total_rows, all_paths)
+        ok = validate_raw_layer(con, total_rows, all_paths, year_months)
 
         register_glue_tables(
             con, glue_client, glue_database, all_paths,
