@@ -78,6 +78,7 @@ resource "aws_iam_group_policy" "developers" {
         Action = [
           "states:ListStateMachines",
           "states:DescribeStateMachine",
+          "states:DescribeStateMachineForExecution",
           "states:ListExecutions",
           "states:DescribeExecution",
           "states:GetExecutionHistory",
@@ -124,6 +125,52 @@ resource "aws_iam_group_policy" "developers" {
           "logs:DescribeLogGroups",
         ]
         Resource = "${aws_cloudwatch_log_group.ecs.arn}:*"
+      },
+      {
+        Sid    = "Athena"
+        Effect = "Allow"
+        Action = [
+          "athena:StartQueryExecution",
+          "athena:StopQueryExecution",
+          "athena:GetQueryExecution",
+          "athena:GetQueryResults",
+          "athena:GetWorkGroup",
+          "athena:ListWorkGroups",
+          "athena:ListQueryExecutions",
+          "athena:ListDatabases",
+          "athena:ListTableMetadata",
+          "athena:GetTableMetadata",
+          "athena:ListDataCatalogs",
+          "athena:GetDataCatalog",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "GlueCatalogRead"
+        Effect = "Allow"
+        Action = [
+          "glue:GetDatabase",
+          "glue:GetDatabases",
+          "glue:GetTable",
+          "glue:GetTables",
+          "glue:GetPartitions",
+          "glue:GetPartition",
+        ]
+        Resource = [
+          "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:catalog",
+          "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:database/${var.glue_database}",
+          "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:table/${var.glue_database}/*",
+        ]
+      },
+      {
+        Sid    = "AthenaResults"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:AbortMultipartUpload",
+        ]
+        Resource = "${aws_s3_bucket.data.arn}/athena/*"
       }
     ]
   })
