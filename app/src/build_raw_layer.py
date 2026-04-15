@@ -1,25 +1,10 @@
-"""Build the RAW layer from staging FHVHV trip data stored in S3.
-
-Reads staging parquet files from S3 via DuckDB httpfs, runs data quality
-analysis, splits the monolithic schema into context-based raw tables,
-writes them back to S3, and registers every table in the AWS Glue Data
-Catalog so they're immediately queryable from Athena / Spark / Redshift
-Spectrum.
-
-Only the months specified by START_MONTH / END_MONTH are processed.
-
-Designed to run inside an ECS Fargate task.  Configuration is read from
-environment variables:
-
-    S3_BUCKET              – S3 bucket for input and output (required)
-    START_MONTH            – first month to process, YYYY-MM (required)
-    END_MONTH              – last  month to process, YYYY-MM (required)
-    S3_STAGING_PREFIX      – key prefix for staging parquets (default: "staging")
-    S3_RAW_PREFIX          – key prefix for raw output       (default: "raw")
-    GLUE_DATABASE          – Glue catalog database name      (default: "trip_record_data")
-    AWS_REGION             – AWS region                      (default: "us-east-1")
-    SKIP_QUALITY_ANALYSIS  – set "true" to skip the profiling step
-"""
+# S3_BUCKET              – bucket for input/output (required)
+# START_MONTH / END_MONTH – YYYY-MM range (required)
+# S3_STAGING_PREFIX      – staging key prefix  (default: "staging")
+# S3_RAW_PREFIX          – raw output prefix   (default: "raw")
+# GLUE_DATABASE          – Glue database name  (default: "trip_record_data")
+# AWS_REGION             – AWS region          (default: "us-east-1")
+# SKIP_QUALITY_ANALYSIS  – "true" to skip profiling
 
 import logging
 import os
@@ -37,8 +22,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-# ── Table definitions ────────────────────────────────────────────────────
 
 RAW_TABLE_COLUMNS = {
     "raw_dispatch_base": [
@@ -100,10 +83,7 @@ DUCKDB_TO_GLUE_TYPE = {
 DB_PATH = Path("/tmp/_build_raw.duckdb")
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-
 def month_range(start: str, end: str) -> list[str]:
-    """Return a list of 'YYYY-MM' strings from *start* to *end* inclusive."""
     start_dt = datetime.strptime(start, "%Y-%m")
     end_dt = datetime.strptime(end, "%Y-%m")
     if start_dt > end_dt:
@@ -121,7 +101,6 @@ def month_range(start: str, end: str) -> list[str]:
 
 
 def _find_reference_dir() -> Path:
-    """Locate the reference/ directory (works both in Docker and local dev)."""
     script_dir = Path(__file__).resolve().parent
     for ancestor in (script_dir.parent, script_dir.parent.parent):
         candidate = ancestor / "reference"
@@ -131,11 +110,6 @@ def _find_reference_dir() -> Path:
 
 
 def init_duckdb(region: str) -> duckdb.DuckDBPyConnection:
-    """Create a DuckDB connection with S3 via IAM credential chain.
-
-    Uses a persistent on-disk database so DuckDB can spill large
-    intermediates to the container's ephemeral storage.
-    """
     con = duckdb.connect(str(DB_PATH))
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("INSTALL aws; LOAD aws;")
@@ -153,7 +127,6 @@ def cleanup_duckdb() -> None:
 def staging_s3_paths(
     bucket: str, prefix: str, months: list[str],
 ) -> list[str]:
-    """Build the explicit list of S3 parquet URIs for the given months."""
     return [
         f"s3://{bucket}/{prefix}/fhvhv_tripdata_{ym}.parquet"
         for ym in months
@@ -161,20 +134,13 @@ def staging_s3_paths(
 
 
 def staging_paths_sql(paths: list[str]) -> str:
-    """Format a list of S3 URIs into a DuckDB list literal for read_parquet()."""
     inner = ", ".join(f"'{p}'" for p in paths)
     return f"[{inner}]"
 
 
-# ── Discovery ────────────────────────────────────────────────────────────
-
 def verify_staging_files(
     s3_client, bucket: str, paths: list[str],
 ) -> list[dict]:
-    """HEAD each expected staging file. Returns [{"Key": ..., "Size": ...}].
-
-    Exits with error if any file is missing.
-    """
     files: list[dict] = []
     missing: list[str] = []
 
@@ -195,15 +161,9 @@ def verify_staging_files(
     return files
 
 
-# ── Data quality ─────────────────────────────────────────────────────────
-
 def analyze_data_quality(
     con: duckdb.DuckDBPyConnection, paths_lit: str,
 ) -> int:
-    """Profile the staging data and return total row count.
-
-    *paths_lit* is a DuckDB list literal, e.g. ``['s3://…/a.parquet', …]``.
-    """
     log.info("=" * 70)
     log.info("DATA QUALITY ANALYSIS")
     log.info("=" * 70)
@@ -223,7 +183,6 @@ def analyze_data_quality(
     for fname, n in file_counts:
         log.info("  %40s  %14s", Path(fname).name, f"{n:,}")
 
-    # Null analysis
     null_exprs = ", ".join(
         f'SUM(CASE WHEN "{col[0]}" IS NULL THEN 1 ELSE 0 END)'
         for col in schema
@@ -243,7 +202,6 @@ def analyze_data_quality(
     if not found_nulls:
         log.info("  No null values found.")
 
-    # Numeric statistics
     numeric_cols = [
         col[0]
         for col in schema
@@ -266,7 +224,6 @@ def analyze_data_quality(
                 col_name, mn, avg, mx, sd,
             )
 
-    # Categorical distributions
     categorical_cols = [col[0] for col in schema if col[1] == "VARCHAR"]
     for col_name in categorical_cols:
         dist = con.execute(f"""
@@ -287,8 +244,6 @@ def analyze_data_quality(
     return total_rows
 
 
-# ── Raw table build ──────────────────────────────────────────────────────
-
 def build_raw_tables(
     con: duckdb.DuckDBPyConnection,
     paths_lit: str,
@@ -296,13 +251,6 @@ def build_raw_tables(
     bucket: str,
     raw_prefix: str,
 ) -> dict[str, str]:
-    """Materialize staging with trip_id, split into raw tables on S3.
-
-    *paths_lit* is a DuckDB list literal for ``read_parquet()``.
-    Output is Hive-partitioned by ``year_month`` (yyyyMM derived from the
-    staging filename suffix).
-    Returns ``{table_name: s3_base_directory}``.
-    """
     log.info("=" * 70)
     log.info("BUILDING RAW LAYER")
     log.info("=" * 70)
@@ -343,17 +291,11 @@ def build_raw_tables(
     return table_paths
 
 
-# ── Dimension tables ─────────────────────────────────────────────────────
-
 def build_dimension_tables(
     con: duckdb.DuckDBPyConnection,
     bucket: str,
     raw_prefix: str,
 ) -> dict[str, str]:
-    """Convert bundled reference CSVs into parquet dimension tables on S3.
-
-    Returns ``{table_name: s3_parquet_path}``.
-    """
     log.info("Building dimension tables:")
     reference_dir = _find_reference_dir()
     table_paths: dict[str, str] = {}
@@ -380,15 +322,12 @@ def build_dimension_tables(
     return table_paths
 
 
-# ── Validation ───────────────────────────────────────────────────────────
-
 def validate_raw_layer(
     con: duckdb.DuckDBPyConnection,
     total_rows: int,
     table_paths: dict[str, str],
     year_months: list[int],
 ) -> bool:
-    """Check row counts and join consistency for the processed partitions."""
     log.info("=" * 70)
     log.info("VALIDATION")
     log.info("=" * 70)
@@ -449,8 +388,6 @@ def validate_raw_layer(
     return all_ok
 
 
-# ── Glue Data Catalog ────────────────────────────────────────────────────
-
 _PARQUET_SERDE = {
     "InputFormat": (
         "org.apache.hadoop.hive.ql.io.parquet"
@@ -475,7 +412,6 @@ def _glue_columns_from_parquet(
     hive_partitioning: bool = False,
     exclude: set[str] | None = None,
 ) -> list[dict]:
-    """Derive Glue-compatible column definitions from S3 parquet file(s)."""
     hp = ", hive_partitioning=true" if hive_partitioning else ""
     schema = con.execute(
         f"DESCRIBE SELECT * FROM read_parquet('{s3_path}'{hp})"
@@ -499,7 +435,6 @@ def _upsert_glue_table(
     columns: list[dict],
     partition_keys: list[dict] | None = None,
 ) -> str:
-    """Create or update a single Glue table. Returns 'created' or 'updated'."""
     table_input = {
         "Name": table_name,
         "Description": f"Raw layer table: {table_name}",
@@ -537,7 +472,6 @@ def _register_glue_partitions(
     columns: list[dict],
     year_months: list[int],
 ) -> int:
-    """Register Hive-style partitions in Glue. Returns count of new partitions."""
     partition_inputs = [
         {
             "Values": [str(ym)],
@@ -601,7 +535,6 @@ def register_glue_tables(
     raw_prefix: str,
     year_months: list[int],
 ) -> None:
-    """Register all raw and dimension tables in the Glue Data Catalog."""
     log.info("=" * 70)
     log.info("GLUE DATA CATALOG REGISTRATION")
     log.info("=" * 70)
@@ -651,8 +584,6 @@ def register_glue_tables(
                 "         %d new partition(s) registered", n_parts,
             )
 
-
-# ── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
     t_start = time.time()

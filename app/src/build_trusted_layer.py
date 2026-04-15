@@ -1,21 +1,10 @@
-"""Build the TRUSTED layer from raw FHVHV trip data stored in S3.
+# S3_BUCKET              – bucket (required)
+# START_MONTH / END_MONTH – YYYY-MM range (required)
+# S3_RAW_PREFIX          – raw input prefix    (default: "raw")
+# S3_TRUSTED_PREFIX      – trusted output prefix (default: "trusted")
+# GLUE_DATABASE          – Glue database name  (default: "trip_record_data")
+# AWS_REGION             – AWS region          (default: "us-east-1")
 
-Reads raw context tables and dimension tables from S3, joins them into
-a single denormalized ``trusted_trips`` table, applies data-quality
-filters, computes derived fields, writes Hive-partitioned parquet back
-to S3, and registers the table in the AWS Glue Data Catalog.
-
-Designed to run inside an ECS Fargate task.  Configuration is read from
-environment variables:
-
-    S3_BUCKET              – S3 bucket (required)
-    START_MONTH            – first month to process, YYYY-MM (required)
-    END_MONTH              – last  month to process, YYYY-MM (required)
-    S3_RAW_PREFIX          – raw layer key prefix   (default: "raw")
-    S3_TRUSTED_PREFIX      – trusted output prefix  (default: "trusted")
-    GLUE_DATABASE          – Glue database name     (default: "trip_record_data")
-    AWS_REGION             – AWS region             (default: "us-east-1")
-"""
 
 import logging
 import os
@@ -33,8 +22,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-# ── Glue helpers (shared constants) ──────────────────────────────────────
 
 DUCKDB_TO_GLUE_TYPE = {
     "VARCHAR": "string",
@@ -133,10 +120,7 @@ WHERE t.trip_miles > 0
 """
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-
 def month_range(start: str, end: str) -> list[str]:
-    """Return a list of 'YYYY-MM' strings from *start* to *end* inclusive."""
     start_dt = datetime.strptime(start, "%Y-%m")
     end_dt = datetime.strptime(end, "%Y-%m")
     if start_dt > end_dt:
@@ -153,12 +137,11 @@ def month_range(start: str, end: str) -> list[str]:
 
 
 def init_duckdb(region: str) -> duckdb.DuckDBPyConnection:
-    """Persistent DuckDB with S3 via IAM credential chain."""
     con = duckdb.connect(str(DB_PATH))
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("INSTALL aws; LOAD aws;")
     con.execute(f"SET s3_region = '{region}';")
-    con.execute("SET memory_limit = '3GB';")
+    con.execute("SET memory_limit = '3GB';")  # leave 1 GB headroom for OS + Python
     con.execute("CREATE SECRET (TYPE S3, PROVIDER CREDENTIAL_CHAIN);")
     return con
 
@@ -177,15 +160,12 @@ def _dim_path(bucket: str, prefix: str, name: str) -> str:
     return f"s3://{bucket}/{prefix}/{name}/{name}.parquet"
 
 
-# ── Views ────────────────────────────────────────────────────────────────
-
 def create_source_views(
     con: duckdb.DuckDBPyConnection,
     bucket: str,
     raw_prefix: str,
     year_months_csv: str,
 ) -> None:
-    """Register lazy views over the raw S3 parquets and dimension table."""
     for table in RAW_TABLES:
         glob = _raw_glob(bucket, raw_prefix, table)
         con.execute(f"""
@@ -204,17 +184,11 @@ def create_source_views(
     log.info("  VIEW %-30s -> %s", "dim_hvfhs_license", dim_p)
 
 
-# ── Build ────────────────────────────────────────────────────────────────
-
 def build_trusted_trips(
     con: duckdb.DuckDBPyConnection,
     bucket: str,
     trusted_prefix: str,
 ) -> tuple[str, int, int]:
-    """Join raw tables, filter, derive, and write trusted_trips to S3.
-
-    Returns ``(s3_dir, raw_count, trusted_count)``.
-    """
     log.info("=" * 70)
     log.info("BUILDING TRUSTED LAYER")
     log.info("=" * 70)
@@ -250,14 +224,11 @@ def build_trusted_trips(
     return s3_dir, raw_count, trusted_count
 
 
-# ── Validation ───────────────────────────────────────────────────────────
-
 def validate_trusted(
     con: duckdb.DuckDBPyConnection,
     s3_dir: str,
     trusted_count: int,
 ) -> bool:
-    """Sanity-check the output parquet."""
     log.info("=" * 70)
     log.info("VALIDATION")
     log.info("=" * 70)
@@ -273,7 +244,6 @@ def validate_trusted(
         all_ok = False
     log.info("  [%s] Row count: %s", "OK" if ok else "FAIL", f"{n:,}")
 
-    # Null check on key derived columns
     null_check = con.execute(f"""
         SELECT
             SUM(CASE WHEN company_name       IS NULL THEN 1 ELSE 0 END),
@@ -294,7 +264,6 @@ def validate_trusted(
             "OK" if ok else "WARN", col_name, f"{null_count:,}",
         )
 
-    # Range checks
     ranges = con.execute(f"""
         SELECT
             MIN(trip_miles), MAX(trip_miles),
@@ -309,8 +278,6 @@ def validate_trusted(
 
     return all_ok
 
-
-# ── Glue Data Catalog ────────────────────────────────────────────────────
 
 def _glue_columns_from_parquet(
     con: duckdb.DuckDBPyConnection,
@@ -480,8 +447,6 @@ def register_trusted_table(
     )
     log.info("         %d partition(s) registered", n_parts)
 
-
-# ── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
     t_start = time.time()

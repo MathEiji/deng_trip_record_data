@@ -1,26 +1,9 @@
-"""Build the SPECIALIZED layer from trusted FHVHV trip data stored in S3.
-
-Reads the ``trusted_trips`` table and produces four pre-aggregated tables
-designed to answer specific business questions:
-
-    spec_hourly_volume  – trip volume by hour of day   (Q1)
-    spec_daily_volume   – trip volume by day of week   (Q2)
-    spec_trip_distance  – distance distribution stats  (Q3)
-    spec_distance_fare  – distance ↔ fare relationship (Q4)
-
-Each table is Hive-partitioned by ``year_month`` (yyyyMM integer) and
-registered in the AWS Glue Data Catalog.
-
-Configuration via environment variables:
-
-    S3_BUCKET              – S3 bucket (required)
-    START_MONTH            – first month, YYYY-MM (required)
-    END_MONTH              – last  month, YYYY-MM (required)
-    S3_TRUSTED_PREFIX      – trusted layer prefix      (default: "trusted")
-    S3_SPECIALIZED_PREFIX  – specialized output prefix  (default: "specialized")
-    GLUE_DATABASE          – Glue database name         (default: "trip_record_data")
-    AWS_REGION             – AWS region                 (default: "us-east-1")
-"""
+# S3_BUCKET              – bucket (required)
+# START_MONTH / END_MONTH – YYYY-MM range (required)
+# S3_TRUSTED_PREFIX      – trusted input prefix   (default: "trusted")
+# S3_SPECIALIZED_PREFIX  – output prefix          (default: "specialized")
+# GLUE_DATABASE          – Glue database name     (default: "trip_record_data")
+# AWS_REGION             – AWS region             (default: "us-east-1")
 
 import logging
 import os
@@ -38,8 +21,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-# ── Glue helpers ─────────────────────────────────────────────────────────
 
 DUCKDB_TO_GLUE_TYPE = {
     "VARCHAR": "string",
@@ -78,8 +59,6 @@ _PARQUET_SERDE = {
 }
 
 DB_PATH = Path("/tmp/_build_specialized.duckdb")
-
-# ── Specialized table SQL definitions ────────────────────────────────────
 
 SPECIALIZED_TABLES: dict[str, tuple[str, str]] = {
     "spec_hourly_volume": (
@@ -156,8 +135,6 @@ SPECIALIZED_TABLES: dict[str, tuple[str, str]] = {
 }
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-
 def month_range(start: str, end: str) -> list[str]:
     start_dt = datetime.strptime(start, "%Y-%m")
     end_dt = datetime.strptime(end, "%Y-%m")
@@ -189,15 +166,12 @@ def cleanup_duckdb() -> None:
             p.unlink()
 
 
-# ── Build ────────────────────────────────────────────────────────────────
-
 def create_trusted_view(
     con: duckdb.DuckDBPyConnection,
     bucket: str,
     trusted_prefix: str,
     year_months_csv: str,
 ) -> int:
-    """Register a lazy view over trusted_trips and return the row count."""
     glob = f"s3://{bucket}/{trusted_prefix}/trusted_trips/**/*.parquet"
     con.execute(f"""
         CREATE OR REPLACE VIEW trusted_trips AS
@@ -215,10 +189,6 @@ def build_specialized_tables(
     bucket: str,
     spec_prefix: str,
 ) -> dict[str, str]:
-    """Run each aggregation query and write partitioned output to S3.
-
-    Returns ``{table_name: s3_base_directory}``.
-    """
     log.info("=" * 70)
     log.info("BUILDING SPECIALIZED LAYER")
     log.info("=" * 70)
@@ -249,15 +219,12 @@ def build_specialized_tables(
     return table_paths
 
 
-# ── Validation ───────────────────────────────────────────────────────────
-
 def validate_specialized(
     con: duckdb.DuckDBPyConnection,
     table_paths: dict[str, str],
     trusted_count: int,
     year_months: list[int],
 ) -> bool:
-    """Verify each table is non-empty and hourly counts sum correctly."""
     log.info("=" * 70)
     log.info("VALIDATION")
     log.info("=" * 70)
@@ -307,8 +274,6 @@ def validate_specialized(
 
     return all_ok
 
-
-# ── Glue Data Catalog ────────────────────────────────────────────────────
 
 def _glue_columns_from_parquet(
     con: duckdb.DuckDBPyConnection,
@@ -377,7 +342,6 @@ def _register_glue_partitions(
     columns: list[dict],
     year_months: list[int],
 ) -> int:
-    """Create or update Glue partitions for each year_month value."""
     existing: set[tuple] = set()
     paginator = glue_client.get_paginator("get_partitions")
     for page in paginator.paginate(DatabaseName=database, TableName=table_name):
@@ -469,8 +433,6 @@ def register_specialized_tables(
         )
         log.info("    %d partition(s) registered", n_parts)
 
-
-# ── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
     t_start = time.time()
