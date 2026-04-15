@@ -255,6 +255,7 @@ def validate_specialized(
     con: duckdb.DuckDBPyConnection,
     table_paths: dict[str, str],
     trusted_count: int,
+    year_months: list[int],
 ) -> bool:
     """Verify each table is non-empty and hourly counts sum correctly."""
     log.info("=" * 70)
@@ -262,14 +263,17 @@ def validate_specialized(
     log.info("=" * 70)
 
     all_ok = True
+    ym_csv = ", ".join(str(ym) for ym in year_months)
 
     def _glob(s3_dir: str) -> str:
         return f"{s3_dir}/**/*.parquet"
 
     for table_name, s3_dir in table_paths.items():
-        n = con.execute(
-            f"SELECT count(*) FROM read_parquet('{_glob(s3_dir)}', hive_partitioning=true)"
-        ).fetchone()[0]
+        n = con.execute(f"""
+            SELECT count(*)
+            FROM read_parquet('{_glob(s3_dir)}', hive_partitioning=true)
+            WHERE year_month IN ({ym_csv})
+        """).fetchone()[0]
         ok = n > 0
         if not ok:
             all_ok = False
@@ -278,6 +282,7 @@ def validate_specialized(
     hourly_sum = con.execute(f"""
         SELECT SUM(trip_count)
         FROM read_parquet('{_glob(table_paths["spec_hourly_volume"])}', hive_partitioning=true)
+        WHERE year_month IN ({ym_csv})
     """).fetchone()[0]
     ok = hourly_sum == trusted_count
     if not ok:
@@ -290,6 +295,7 @@ def validate_specialized(
     daily_sum = con.execute(f"""
         SELECT SUM(trip_count)
         FROM read_parquet('{_glob(table_paths["spec_daily_volume"])}', hive_partitioning=true)
+        WHERE year_month IN ({ym_csv})
     """).fetchone()[0]
     ok = daily_sum == trusted_count
     if not ok:
@@ -507,7 +513,7 @@ def main() -> None:
         )
 
         table_paths = build_specialized_tables(con, bucket, spec_prefix)
-        ok = validate_specialized(con, table_paths, trusted_count)
+        ok = validate_specialized(con, table_paths, trusted_count, year_months)
 
         register_specialized_tables(
             con, glue_client, glue_database,
