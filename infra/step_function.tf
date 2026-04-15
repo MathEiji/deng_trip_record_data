@@ -18,7 +18,7 @@ resource "aws_sfn_state_machine" "pipeline" {
   role_arn = aws_iam_role.step_functions.arn
 
   definition = jsonencode({
-    Comment = "Full pipeline: download → raw → trusted → specialized"
+    Comment = "Full pipeline: download → raw → trusted → specialized (parallel)"
     StartAt = "DownloadTripData"
     States = {
       DownloadTripData = {
@@ -88,24 +88,35 @@ resource "aws_sfn_state_machine" "pipeline" {
       }
 
       BuildSpecializedLayer = {
-        Type     = "Task"
-        Resource = "arn:aws:states:::ecs:runTask.sync"
-        Parameters = {
-          Cluster              = aws_ecs_cluster.main.arn
-          TaskDefinition       = aws_ecs_task_definition.build_specialized_layer.arn
-          LaunchType           = "FARGATE"
-          NetworkConfiguration = local.ecs_network_config
-          Overrides = {
-            ContainerOverrides = [{
-              Name = "build-specialized-layer"
-              Environment = [
-                { "Name" = "START_MONTH", "Value.$" = "$.start_month" },
-                { "Name" = "END_MONTH", "Value.$" = "$.end_month" },
-              ]
-            }]
+        Type = "Parallel"
+        End  = true
+        Branches = [
+          for key, _ in local.specialized_tables : {
+            StartAt = "Build-${key}"
+            States = {
+              "Build-${key}" = {
+                Type     = "Task"
+                Resource = "arn:aws:states:::ecs:runTask.sync"
+                Parameters = {
+                  Cluster              = aws_ecs_cluster.main.arn
+                  TaskDefinition       = aws_ecs_task_definition.build_specialized[key].arn
+                  LaunchType           = "FARGATE"
+                  NetworkConfiguration = local.ecs_network_config
+                  Overrides = {
+                    ContainerOverrides = [{
+                      Name = "build-${key}"
+                      Environment = [
+                        { "Name" = "START_MONTH", "Value.$" = "$.start_month" },
+                        { "Name" = "END_MONTH", "Value.$" = "$.end_month" },
+                      ]
+                    }]
+                  }
+                }
+                End = true
+              }
+            }
           }
-        }
-        End = true
+        ]
       }
     }
   })

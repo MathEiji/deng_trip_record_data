@@ -140,12 +140,23 @@ resource "aws_ecs_task_definition" "build_trusted_layer" {
   ])
 }
 
-resource "aws_ecs_task_definition" "build_specialized_layer" {
-  family                   = "${var.project_name}-build-specialized"
+locals {
+  specialized_tables = {
+    "spec-hourly-volume" = "src/build_spec_hourly_volume.py"
+    "spec-daily-volume"  = "src/build_spec_daily_volume.py"
+    "spec-trip-distance" = "src/build_spec_trip_distance.py"
+    "spec-distance-fare" = "src/build_spec_distance_fare.py"
+  }
+}
+
+resource "aws_ecs_task_definition" "build_specialized" {
+  for_each = local.specialized_tables
+
+  family                   = "${var.project_name}-build-${each.key}"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = "1024"
-  memory                   = "4096"
+  cpu                      = "512"
+  memory                   = "2048"
   execution_role_arn       = aws_iam_role.ecs_task_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
@@ -160,10 +171,10 @@ resource "aws_ecs_task_definition" "build_specialized_layer" {
 
   container_definitions = jsonencode([
     {
-      name      = "build-specialized-layer"
+      name      = "build-${each.key}"
       image     = "${aws_ecr_repository.app.repository_url}:latest"
       essential = true
-      command   = ["src/build_specialized_layer.py"]
+      command   = [each.value]
 
       environment = [
         { name = "S3_BUCKET", value = var.s3_bucket_name },
@@ -180,7 +191,7 @@ resource "aws_ecs_task_definition" "build_specialized_layer" {
         options = {
           "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
           "awslogs-region"        = data.aws_region.current.name
-          "awslogs-stream-prefix" = "build-specialized"
+          "awslogs-stream-prefix" = "build-${each.key}"
         }
       }
     }

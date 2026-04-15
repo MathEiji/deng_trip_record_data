@@ -31,7 +31,14 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: trip-record-data
   ECS_CLUSTER: trip-record-data
-  TASK_FAMILIES: trip-record-data-download trip-record-data-build-raw trip-record-data-build-trusted trip-record-data-build-specialized
+  TASK_FAMILIES: >-
+    trip-record-data-download
+    trip-record-data-build-raw
+    trip-record-data-build-trusted
+    trip-record-data-build-spec-hourly-volume
+    trip-record-data-build-spec-daily-volume
+    trip-record-data-build-spec-trip-distance
+    trip-record-data-build-spec-distance-fare
   STATE_MACHINE_ARN: ${{ secrets.STATE_MACHINE_ARN }}
 
 jobs:

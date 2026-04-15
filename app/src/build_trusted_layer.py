@@ -5,16 +5,24 @@
 # GLUE_DATABASE          – Glue database name  (default: "trip_record_data")
 # AWS_REGION             – AWS region          (default: "us-east-1")
 
-
 import logging
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import boto3
 import duckdb
+
+from _pipeline_common import (
+    cleanup_duckdb,
+    ensure_glue_database,
+    glue_columns_from_parquet,
+    init_duckdb,
+    month_range,
+    register_glue_partitions,
+    upsert_glue_table,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,42 +30,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-DUCKDB_TO_GLUE_TYPE = {
-    "VARCHAR": "string",
-    "BIGINT": "bigint",
-    "INTEGER": "int",
-    "SMALLINT": "smallint",
-    "TINYINT": "tinyint",
-    "DOUBLE": "double",
-    "FLOAT": "float",
-    "REAL": "float",
-    "TIMESTAMP": "timestamp",
-    "TIMESTAMP WITH TIME ZONE": "timestamp",
-    "TIMESTAMP_S": "timestamp",
-    "TIMESTAMP_MS": "timestamp",
-    "TIMESTAMP_NS": "timestamp",
-    "DATE": "date",
-    "BOOLEAN": "boolean",
-    "BLOB": "binary",
-}
-
-_PARQUET_SERDE = {
-    "InputFormat": (
-        "org.apache.hadoop.hive.ql.io.parquet"
-        ".MapredParquetInputFormat"
-    ),
-    "OutputFormat": (
-        "org.apache.hadoop.hive.ql.io.parquet"
-        ".MapredParquetOutputFormat"
-    ),
-    "SerdeInfo": {
-        "SerializationLibrary": (
-            "org.apache.hadoop.hive.ql.io.parquet"
-            ".serde.ParquetHiveSerDe"
-        ),
-    },
-}
 
 DB_PATH = Path("/tmp/_build_trusted.duckdb")
 
@@ -118,38 +90,6 @@ WHERE t.trip_miles > 0
   AND t.pickup_datetime IS NOT NULL
   AND t.dropoff_datetime IS NOT NULL
 """
-
-
-def month_range(start: str, end: str) -> list[str]:
-    start_dt = datetime.strptime(start, "%Y-%m")
-    end_dt = datetime.strptime(end, "%Y-%m")
-    if start_dt > end_dt:
-        raise ValueError(f"Start {start} is after end {end}")
-    months: list[str] = []
-    current = start_dt
-    while current <= end_dt:
-        months.append(current.strftime("%Y-%m"))
-        if current.month == 12:
-            current = current.replace(year=current.year + 1, month=1)
-        else:
-            current = current.replace(month=current.month + 1)
-    return months
-
-
-def init_duckdb(region: str) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(str(DB_PATH))
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute("INSTALL aws; LOAD aws;")
-    con.execute(f"SET s3_region = '{region}';")
-    con.execute("SET memory_limit = '3GB';")  # leave 1 GB headroom for OS + Python
-    con.execute("CREATE SECRET (TYPE S3, PROVIDER CREDENTIAL_CHAIN);")
-    return con
-
-
-def cleanup_duckdb() -> None:
-    for p in (DB_PATH, DB_PATH.with_suffix(".duckdb.wal")):
-        if p.exists():
-            p.unlink()
 
 
 def _raw_glob(bucket: str, prefix: str, table: str) -> str:
@@ -279,127 +219,6 @@ def validate_trusted(
     return all_ok
 
 
-def _glue_columns_from_parquet(
-    con: duckdb.DuckDBPyConnection,
-    s3_path: str,
-    hive_partitioning: bool = False,
-    exclude: set[str] | None = None,
-) -> list[dict]:
-    hp = ", hive_partitioning=true" if hive_partitioning else ""
-    schema = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{s3_path}'{hp})"
-    ).fetchall()
-    excl = exclude or set()
-    return [
-        {
-            "Name": col_name,
-            "Type": DUCKDB_TO_GLUE_TYPE.get(col_type, "string"),
-        }
-        for col_name, col_type, *_ in schema
-        if col_name not in excl
-    ]
-
-
-def _upsert_glue_table(
-    glue_client,
-    database: str,
-    table_name: str,
-    s3_location: str,
-    columns: list[dict],
-    description: str = "",
-    partition_keys: list[dict] | None = None,
-) -> str:
-    table_input = {
-        "Name": table_name,
-        "Description": description or f"Trusted layer: {table_name}",
-        "StorageDescriptor": {
-            "Columns": columns,
-            "Location": s3_location,
-            **_PARQUET_SERDE,
-        },
-        "TableType": "EXTERNAL_TABLE",
-        "Parameters": {
-            "classification": "parquet",
-            "typeOfData": "file",
-        },
-    }
-    if partition_keys:
-        table_input["PartitionKeys"] = partition_keys
-
-    try:
-        glue_client.update_table(
-            DatabaseName=database, TableInput=table_input,
-        )
-        return "updated"
-    except glue_client.exceptions.EntityNotFoundException:
-        glue_client.create_table(
-            DatabaseName=database, TableInput=table_input,
-        )
-        return "created"
-
-
-def _register_glue_partitions(
-    glue_client,
-    database: str,
-    table_name: str,
-    s3_location: str,
-    columns: list[dict],
-    year_months: list[int],
-) -> int:
-    partition_inputs = [
-        {
-            "Values": [str(ym)],
-            "StorageDescriptor": {
-                "Columns": columns,
-                "Location": f"{s3_location}year_month={ym}/",
-                **_PARQUET_SERDE,
-            },
-        }
-        for ym in year_months
-    ]
-
-    registered = 0
-    for i in range(0, len(partition_inputs), 100):
-        batch = partition_inputs[i : i + 100]
-        resp = glue_client.batch_create_partition(
-            DatabaseName=database,
-            TableName=table_name,
-            PartitionInputList=batch,
-        )
-        errors = resp.get("Errors", [])
-        registered += len(batch) - len(errors)
-
-        to_update = []
-        for err in errors:
-            if err["ErrorDetail"]["ErrorCode"] == "AlreadyExistsException":
-                vals = err["PartitionValues"]
-                matching = [p for p in batch if p["Values"] == vals]
-                if matching:
-                    to_update.append(matching[0])
-            else:
-                log.warning(
-                    "  Partition %s: %s",
-                    err["PartitionValues"],
-                    err["ErrorDetail"]["ErrorMessage"],
-                )
-
-        if to_update:
-            glue_client.batch_update_partition(
-                DatabaseName=database,
-                TableName=table_name,
-                Entries=[
-                    {
-                        "PartitionValueList": p["Values"],
-                        "PartitionInput": p,
-                    }
-                    for p in to_update
-                ],
-            )
-            registered += len(to_update)
-
-    return registered
-
-
 def register_trusted_table(
     con: duckdb.DuckDBPyConnection,
     glue_client,
@@ -413,25 +232,16 @@ def register_trusted_table(
     log.info("GLUE DATA CATALOG REGISTRATION")
     log.info("=" * 70)
 
-    try:
-        glue_client.create_database(
-            DatabaseInput={
-                "Name": database,
-                "Description": "NYC TLC FHVHV trip record data",
-            }
-        )
-        log.info("Created Glue database: %s", database)
-    except glue_client.exceptions.AlreadyExistsException:
-        log.info("Glue database exists: %s", database)
+    ensure_glue_database(glue_client, database)
 
     glob = f"{s3_dir}/**/*.parquet"
     s3_location = f"s3://{bucket}/{trusted_prefix}/trusted_trips/"
-    columns = _glue_columns_from_parquet(
+    columns = glue_columns_from_parquet(
         con, glob, hive_partitioning=True, exclude={"year_month"},
     )
     partition_keys = [{"Name": "year_month", "Type": "int"}]
 
-    action = _upsert_glue_table(
+    action = upsert_glue_table(
         glue_client, database, "trusted_trips", s3_location,
         columns, "Trusted layer: denormalized, cleaned trip data",
         partition_keys,
@@ -441,7 +251,7 @@ def register_trusted_table(
         action, database, len(columns), s3_location,
     )
 
-    n_parts = _register_glue_partitions(
+    n_parts = register_glue_partitions(
         glue_client, database, "trusted_trips",
         s3_location, columns, year_months,
     )
@@ -479,7 +289,7 @@ def main() -> None:
     log.info("  Glue database : %s", glue_database)
     log.info("=" * 70)
 
-    con = init_duckdb(region)
+    con = init_duckdb(DB_PATH, region, memory_limit="3GB")
 
     try:
         log.info("Creating source views …")
@@ -496,7 +306,7 @@ def main() -> None:
         )
     finally:
         con.close()
-        cleanup_duckdb()
+        cleanup_duckdb(DB_PATH)
 
     elapsed = time.time() - t_start
     log.info("=" * 70)
