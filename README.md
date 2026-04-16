@@ -112,6 +112,188 @@ Each table is built by its own script, running in parallel via Step Functions. A
 
 ---
 
+## Schemas
+
+### Raw layer
+
+All raw tables share three common columns: `trip_id` (BIGINT, join key), `processed_date` (TIMESTAMP), and `year_month` (INTEGER, partition key).
+
+#### `raw_dispatch_base`
+
+| Column | Type |
+|---|---|
+| `trip_id` | BIGINT |
+| `processed_date` | TIMESTAMP |
+| `hvfhs_license_num` | VARCHAR |
+| `dispatching_base_num` | VARCHAR |
+| `originating_base_num` | VARCHAR |
+| `year_month` | INTEGER *(partition)* |
+
+#### `raw_trip_time_location`
+
+| Column | Type |
+|---|---|
+| `trip_id` | BIGINT |
+| `processed_date` | TIMESTAMP |
+| `request_datetime` | TIMESTAMP |
+| `on_scene_datetime` | TIMESTAMP |
+| `pickup_datetime` | TIMESTAMP |
+| `dropoff_datetime` | TIMESTAMP |
+| `PULocationID` | INTEGER |
+| `DOLocationID` | INTEGER |
+| `trip_miles` | DOUBLE |
+| `trip_time` | BIGINT |
+| `year_month` | INTEGER *(partition)* |
+
+#### `raw_fare_payment`
+
+| Column | Type |
+|---|---|
+| `trip_id` | BIGINT |
+| `processed_date` | TIMESTAMP |
+| `base_passenger_fare` | DOUBLE |
+| `tolls` | DOUBLE |
+| `bcf` | DOUBLE |
+| `sales_tax` | DOUBLE |
+| `congestion_surcharge` | DOUBLE |
+| `airport_fee` | DOUBLE |
+| `tips` | DOUBLE |
+| `driver_pay` | DOUBLE |
+| `cbd_congestion_fee` | DOUBLE |
+| `year_month` | INTEGER *(partition)* |
+
+#### `raw_request_flags`
+
+| Column | Type |
+|---|---|
+| `trip_id` | BIGINT |
+| `processed_date` | TIMESTAMP |
+| `shared_request_flag` | VARCHAR |
+| `shared_match_flag` | VARCHAR |
+| `access_a_ride_flag` | VARCHAR |
+| `wav_request_flag` | VARCHAR |
+| `wav_match_flag` | VARCHAR |
+| `year_month` | INTEGER *(partition)* |
+
+### Dimension tables
+
+#### `dim_hvfhs_license`
+
+| Column | Type |
+|---|---|
+| `hvfhs_license_num` | VARCHAR |
+| `company_name` | VARCHAR |
+| `dispatching_base_num` | VARCHAR |
+| `status` | VARCHAR |
+
+#### `dim_base`
+
+| Column | Type |
+|---|---|
+| `base_number` | VARCHAR |
+| `base_name` | VARCHAR |
+| `parent_company` | VARCHAR |
+| `base_type` | VARCHAR |
+
+### Trusted layer
+
+#### `trusted_trips`
+
+Denormalized, cleaned join of all raw tables with derived fields and quality filters applied.
+
+| Column | Type | Source |
+|---|---|---|
+| `trip_id` | BIGINT | `raw_dispatch_base` |
+| `processed_date` | TIMESTAMP | generated |
+| `company_name` | VARCHAR | `dim_hvfhs_license` |
+| `hvfhs_license_num` | VARCHAR | `raw_dispatch_base` |
+| `request_datetime` | TIMESTAMP | `raw_trip_time_location` |
+| `pickup_datetime` | TIMESTAMP | `raw_trip_time_location` |
+| `dropoff_datetime` | TIMESTAMP | `raw_trip_time_location` |
+| `pickup_date` | DATE | derived |
+| `pickup_hour` | SMALLINT | derived |
+| `pickup_day_of_week` | SMALLINT | derived |
+| `pickup_day_name` | VARCHAR | derived |
+| `wait_time_seconds` | INTEGER | derived: `pickup - request` |
+| `trip_duration_seconds` | INTEGER | derived: `dropoff - pickup` |
+| `trip_miles` | DOUBLE | `raw_trip_time_location` |
+| `trip_time_seconds` | BIGINT | `raw_trip_time_location` |
+| `pickup_location_id` | INTEGER | `raw_trip_time_location` |
+| `dropoff_location_id` | INTEGER | `raw_trip_time_location` |
+| `base_passenger_fare` | DOUBLE | `raw_fare_payment` |
+| `tolls` | DOUBLE | `raw_fare_payment` |
+| `congestion_surcharge` | DOUBLE | `raw_fare_payment` |
+| `airport_fee` | DOUBLE | `raw_fare_payment` |
+| `tips` | DOUBLE | `raw_fare_payment` |
+| `driver_pay` | DOUBLE | `raw_fare_payment` |
+| `total_fare` | DOUBLE | derived: sum of all fare components |
+| `fare_per_mile` | DOUBLE | derived: `total_fare / trip_miles` |
+| `is_shared_request` | BOOLEAN | `raw_request_flags` |
+| `is_shared_match` | BOOLEAN | `raw_request_flags` |
+| `is_wav_match` | BOOLEAN | `raw_request_flags` |
+| `year_month` | INTEGER *(partition)* | derived from filename |
+
+**Filters applied:** `trip_miles ∈ (0, 200]`, `trip_time ∈ (0, 14400]`, `base_passenger_fare ∈ (0, 500]`, `dropoff > pickup`, no null timestamps.
+
+### Specialized layer
+
+#### `spec_hourly_volume` — Q1: peak hours of day
+
+| Column | Type |
+|---|---|
+| `company_name` | VARCHAR |
+| `pickup_hour` | SMALLINT |
+| `trip_count` | BIGINT |
+| `avg_trip_miles` | DOUBLE |
+| `avg_total_fare` | DOUBLE |
+| `avg_duration_seconds` | DOUBLE |
+| `year_month` | INTEGER *(partition)* |
+
+#### `spec_daily_volume` — Q2: peak days of week
+
+| Column | Type |
+|---|---|
+| `company_name` | VARCHAR |
+| `pickup_day_of_week` | SMALLINT |
+| `pickup_day_name` | VARCHAR |
+| `trip_count` | BIGINT |
+| `avg_trip_miles` | DOUBLE |
+| `avg_total_fare` | DOUBLE |
+| `avg_duration_seconds` | DOUBLE |
+| `year_month` | INTEGER *(partition)* |
+
+#### `spec_trip_distance` — Q3: distance distribution
+
+| Column | Type |
+|---|---|
+| `company_name` | VARCHAR |
+| `trip_count` | BIGINT |
+| `avg_miles` | DOUBLE |
+| `median_miles` | DOUBLE |
+| `p95_miles` | DOUBLE |
+| `stddev_miles` | DOUBLE |
+| `min_miles` | DOUBLE |
+| `max_miles` | DOUBLE |
+| `year_month` | INTEGER *(partition)* |
+
+#### `spec_distance_fare` — Q4: distance vs fare
+
+| Column | Type |
+|---|---|
+| `company_name` | VARCHAR |
+| `distance_bucket` | VARCHAR |
+| `trip_count` | BIGINT |
+| `avg_base_fare` | DOUBLE |
+| `avg_total_fare` | DOUBLE |
+| `avg_fare_per_mile` | DOUBLE |
+| `avg_tips` | DOUBLE |
+| `avg_duration_seconds` | DOUBLE |
+| `year_month` | INTEGER *(partition)* |
+
+`distance_bucket` values: `0-2 mi`, `2-5 mi`, `5-10 mi`, `10-20 mi`, `20+ mi`.
+
+---
+
 ## Infrastructure
 
 All AWS resources are defined as Terraform in `infra/`. The pipeline is designed to stay within free-tier limits where possible.
