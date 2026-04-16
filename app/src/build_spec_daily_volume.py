@@ -1,6 +1,6 @@
 """Specialized table: trip volume by day of week (Q2 — peak weekdays)."""
 
-from _specialized_common import run
+from common.specialized import run
 
 SQL = """\
 SELECT

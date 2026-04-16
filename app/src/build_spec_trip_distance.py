@@ -1,6 +1,6 @@
 """Specialized table: distance distribution statistics (Q3 — average distance)."""
 
-from _specialized_common import run
+from common.specialized import run
 
 SQL = """\
 SELECT

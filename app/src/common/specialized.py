@@ -1,7 +1,6 @@
 """Specialized-layer entrypoint shared by each build_spec_*.py script.
 
-Imports infrastructure from ``_pipeline_common`` and adds the
-specialized-specific build/validate/register lifecycle via ``run()``.
+Provides the build/validate/register lifecycle via ``run()``.
 """
 
 import logging
@@ -13,7 +12,7 @@ from pathlib import Path
 import boto3
 import duckdb
 
-from _pipeline_common import (
+from common.pipeline import (
     cleanup_duckdb,
     ensure_glue_database,
     glue_columns_from_parquet,

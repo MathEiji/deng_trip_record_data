@@ -1,6 +1,6 @@
 """Specialized table: distance vs fare relationship (Q4)."""
 
-from _specialized_common import run
+from common.specialized import run
 
 SQL = """\
 SELECT

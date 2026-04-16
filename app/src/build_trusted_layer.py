@@ -14,7 +14,7 @@ from pathlib import Path
 import boto3
 import duckdb
 
-from _pipeline_common import (
+from common.pipeline import (
     cleanup_duckdb,
     ensure_glue_database,
     glue_columns_from_parquet,
