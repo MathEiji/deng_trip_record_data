@@ -2,17 +2,24 @@
 
 # NYC TLC Trip Record Data Pipelines
 
-This repository contains data pipelines and exploration using **New York City Taxi and Limousine Commission (TLC) Trip Record Data**, in particular the **High Volume For-Hire Vehicle (FHVHV)** trip records (e.g. Uber, Lyft).
+Data engineering project that ingests, transforms, and serves **New York City Taxi and Limousine Commission (TLC) High Volume For-Hire Vehicle (FHVHV)** trip records (Uber, Lyft) through a multi-layer data pipeline running on AWS.
 
 **Data source:** [TLC Trip Record Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page)
 
 ---
 
-## Data
+## Architecture
 
-- **Format:** Parquet (e.g. `fhvhv_tripdata_YYYY-MM.parquet`)
-- **Typical size:** Tens of millions of rows per month (~21M for Jan 2026 sample)
-- **Location:** Downloaded files live in `data/staging/` (git-ignored). Run the download script to fetch them.
+```
+┌────────────┐     ┌───────────┐     ┌─────────────┐     ┌──────────────────────────┐
+│  Download   │────▶│  Raw      │────▶│  Trusted    │────▶│  Specialized (×4)        │
+│  (staging)  │     │  Layer    │     │  Layer      │     │  (parallel)              │
+└────────────┘     └───────────┘     └─────────────┘     └──────────────────────────┘
+```
+
+Orchestrated by **AWS Step Functions**, each stage runs as an **ECS Fargate** task (ARM64/Graviton). Data is stored in **S3** as Hive-partitioned Parquet and cataloged in **AWS Glue Data Catalog** for querying via Athena.
+
+All data is partitioned by `year_month` (integer, `yyyyMM` format).
 
 ---
 
@@ -20,115 +27,64 @@ This repository contains data pipelines and exploration using **New York City Ta
 
 ```
 deng_trip_record_data/
-├── .github/
-│   └── workflows/
-│       └── deploy.yml              # CI/CD: build → ECR → ECS task definition
+├── .github/workflows/
+│   └── deploy.yml                    # CI/CD: build → ECR → ECS task definitions
 ├── app/
-│   ├── Dockerfile                  # Container image for download job
+│   ├── Dockerfile
 │   └── src/
-│       ├── download_trip_data.py   # Download FHVHV parquets from the TLC CDN
-│       ├── build_raw_layer.py      # Build raw tables from staging data
-│       ├── build_trusted_layer.py  # Build trusted_trips from raw tables
-│       ├── build_specialized_layer.py # Build aggregated tables from trusted
-│       └── requirements.txt        # App dependencies (requests, duckdb, boto3)
-├── infra/                          # Terraform (ECS Fargate + ECR + S3 + IAM)
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── outputs.tf
-│   ├── ecr.tf
-│   ├── ecs.tf
-│   ├── iam.tf
-│   ├── s3.tf
-│   └── cloudwatch.tf
-├── data/
-│   ├── staging/                    # Downloaded parquet files (git-ignored)
-│   ├── raw/                        # Context-based raw tables (git-ignored)
-│   ├── trusted/                    # Denormalized, cleaned trip data (git-ignored)
-│   └── specialized/                # Pre-aggregated analytical tables (git-ignored)
-├── reference/                      # Dimension CSVs (version-controlled)
-│   ├── dim_hvfhs_license.csv       # HVFHS license → company mapping
-│   └── dim_base.csv                # TLC base number → company mapping
-├── notebooks/
-│   ├── data_check.ipynb            # Ad-hoc checks and counts (DuckDB + pandas)
-│   ├── raw_tables_exploration.ipynb# Raw tables design by context
-│   └── requirements.txt           # Notebook dependencies (pandas, duckdb, pyarrow, requests)
-├── .gitignore
-└── README.md
+│       ├── common/                   # Shared pipeline infrastructure
+│       │   ├── __init__.py
+│       │   ├── pipeline.py           # DuckDB lifecycle, Glue helpers, constants
+│       │   └── specialized.py        # Specialized-layer orchestrator (run())
+│       ├── download_trip_data.py     # Stream FHVHV parquets from TLC CDN to S3
+│       ├── build_raw_layer.py        # Split staging into context-based raw tables
+│       ├── build_trusted_layer.py    # Denormalize, clean, enrich into trusted_trips
+│       ├── build_spec_hourly_volume.py   # Q1: peak hours
+│       ├── build_spec_daily_volume.py    # Q2: peak weekdays
+│       ├── build_spec_trip_distance.py   # Q3: distance distribution
+│       ├── build_spec_distance_fare.py   # Q4: distance vs fare
+│       └── requirements.txt
+├── infra/                            # Terraform: ECS, ECR, S3, IAM, Glue, SFN, etc.
+├── reference/                        # Dimension CSVs (version-controlled)
+│   ├── dim_hvfhs_license.csv
+│   └── dim_base.csv
+├── notebooks/                        # Ad-hoc exploration and checks
+└── data/                             # Local data (git-ignored)
 ```
 
 ---
 
-## Downloading data
+## Pipeline stages
 
-Use `download_trip_data.py` to fetch FHVHV parquet files for a range of months:
+### 1. Download (`download_trip_data.py`)
 
-```bash
-python app/src/download_trip_data.py 2025-01 2025-06
-```
+Streams FHVHV parquet files from the NYC TLC CDN directly to S3 using multipart uploads. Skips files that already exist in the bucket.
 
-Files are saved to `data/staging/`. Already-downloaded files are skipped on re-run.
+**Input:** NYC TLC CDN  
+**Output:** `s3://<bucket>/staging/fhvhv_tripdata_YYYY-MM.parquet`
 
----
+### 2. Raw layer (`build_raw_layer.py`)
 
-## Building the raw layer
+Reads staging parquets, runs data quality analysis, assigns a `trip_id` and `processed_date`, then splits into 4 context-based tables plus dimension tables. Registers all tables and partitions in Glue.
 
-Once staging data is downloaded, build the raw layer:
+**Input:** `s3://<bucket>/staging/`  
+**Output:** `s3://<bucket>/raw/<table_name>/year_month=YYYYMM/`
 
-```bash
-python app/src/build_raw_layer.py
-```
-
-The script:
-1. Scans all `data/staging/fhvhv_tripdata_*.parquet` files
-2. Runs a data quality analysis (nulls, distributions, statistics)
-3. Assigns a deterministic `trip_id` and `processed_date` to every row
-4. Splits the monolithic schema into 4 context-based raw tables in `data/raw/`
-5. Converts dimension CSVs from `reference/` into parquet dimension tables
-6. Validates row counts and join consistency
-
----
-
-## Raw tables (by context)
-
-The raw layer splits the single FHVHV parquet into logical tables. Each table includes:
-- **trip_id** — join key across raw tables
-- **processed_date** — partition column in `yyyyMMdd` format (e.g. `20260308`)
-
-| Raw table | Context | Main columns |
-|-----------|---------|--------------|
+| Raw table | Context | Key columns |
+|---|---|---|
 | **raw_dispatch_base** | Dispatch / base | `hvfhs_license_num`, `dispatching_base_num`, `originating_base_num` |
-| **raw_trip_time_location** | Trip timing & locations | `request_datetime`, `on_scene_datetime`, `pickup_datetime`, `dropoff_datetime`, `PULocationID`, `DOLocationID`, `trip_miles`, `trip_time` |
-| **raw_fare_payment** | Fare and payment | `base_passenger_fare`, `tolls`, `bcf`, `sales_tax`, `congestion_surcharge`, `airport_fee`, `tips`, `driver_pay`, `cbd_congestion_fee` |
+| **raw_trip_time_location** | Timing & locations | `request_datetime`, `pickup_datetime`, `dropoff_datetime`, `PULocationID`, `DOLocationID`, `trip_miles`, `trip_time` |
+| **raw_fare_payment** | Fare & payment | `base_passenger_fare`, `tolls`, `bcf`, `sales_tax`, `congestion_surcharge`, `airport_fee`, `tips`, `driver_pay` |
 | **raw_request_flags** | Request flags | `shared_request_flag`, `shared_match_flag`, `access_a_ride_flag`, `wav_request_flag`, `wav_match_flag` |
 
-### Dimension tables
+**Dimension tables:** `dim_hvfhs_license`, `dim_base` (from `reference/` CSVs)
 
-Reference/lookup tables stored as CSVs in `reference/` and converted to parquet during build:
+### 3. Trusted layer (`build_trusted_layer.py`)
 
-| Dimension table | Purpose | Columns |
-|-----------------|---------|---------|
-| **dim_hvfhs_license** | HVFHS license → company | `hvfhs_license_num`, `company_name`, `dispatching_base_num`, `status` |
-| **dim_base** | TLC base number → company | `base_number`, `base_name`, `parent_company`, `base_type` |
+Joins all 4 raw tables + `dim_hvfhs_license`, applies quality filters (positive fare/distance, outlier caps, temporal consistency), and computes derived fields. Uses a 3 GB DuckDB memory limit to fit within Fargate's 4 GB container.
 
-See `notebooks/raw_tables_exploration.ipynb` for schema inspection, sampling, and optional code to write these tables to Parquet.
-
----
-
-## Trusted layer
-
-The trusted layer denormalizes, cleans, and enriches the raw tables into a single `trusted_trips` table. Build it after the raw layer:
-
-```bash
-python app/src/build_trusted_layer.py
-```
-
-Env vars: `S3_BUCKET`, `START_MONTH`, `END_MONTH`, `S3_RAW_PREFIX` (default `raw`), `S3_TRUSTED_PREFIX` (default `trusted`), `GLUE_DATABASE`, `AWS_REGION`.
-
-**What it does:**
-1. Joins all 4 raw tables + `dim_hvfhs_license` on `trip_id` / `year_month`
-2. Applies quality filters (positive fare/distance, caps on outliers, temporal consistency)
-3. Computes derived fields (pickup hour, day of week, wait time, trip duration, total fare, fare per mile)
-4. Writes Hive-partitioned parquet to S3 and registers in Glue
+**Input:** `s3://<bucket>/raw/`  
+**Output:** `s3://<bucket>/trusted/trusted_trips/year_month=YYYYMM/`
 
 | Column group | Fields |
 |---|---|
@@ -140,39 +96,35 @@ Env vars: `S3_BUCKET`, `START_MONTH`, `END_MONTH`, `S3_RAW_PREFIX` (default `raw
 | **Fare** | `base_passenger_fare`, `tolls`, `congestion_surcharge`, `airport_fee`, `tips`, `driver_pay`, `total_fare`, `fare_per_mile` |
 | **Flags** | `is_shared_request`, `is_shared_match`, `is_wav_match` |
 
----
+### 4. Specialized layer (4 parallel tasks)
 
-## Specialized layer
+Each table is built by its own script, running in parallel via Step Functions. All read from `trusted_trips` and write Hive-partitioned output.
 
-The specialized layer pre-aggregates `trusted_trips` into four tables, one per business question:
+**Input:** `s3://<bucket>/trusted/trusted_trips/`  
+**Output:** `s3://<bucket>/specialized/<table_name>/year_month=YYYYMM/`
 
-```bash
-python app/src/build_specialized_layer.py
-```
-
-Env vars: `S3_BUCKET`, `START_MONTH`, `END_MONTH`, `S3_TRUSTED_PREFIX` (default `trusted`), `S3_SPECIALIZED_PREFIX` (default `specialized`), `GLUE_DATABASE`, `AWS_REGION`.
-
-| Table | Question | Grain |
-|---|---|---|
-| **spec_hourly_volume** | Q1: Peak hours of day | `year_month` x `company_name` x `pickup_hour` |
-| **spec_daily_volume** | Q2: Peak days of week | `year_month` x `company_name` x `pickup_day_of_week` |
-| **spec_trip_distance** | Q3: Average distance | `year_month` x `company_name` |
-| **spec_distance_fare** | Q4: Distance vs fare | `year_month` x `company_name` x `distance_bucket` |
+| Script | Table | Question | Grain |
+|---|---|---|---|
+| `build_spec_hourly_volume.py` | **spec_hourly_volume** | Q1: Peak hours of day | `year_month` × `company` × `pickup_hour` |
+| `build_spec_daily_volume.py` | **spec_daily_volume** | Q2: Peak days of week | `year_month` × `company` × `day_of_week` |
+| `build_spec_trip_distance.py` | **spec_trip_distance** | Q3: Distance distribution | `year_month` × `company` |
+| `build_spec_distance_fare.py` | **spec_distance_fare** | Q4: Distance vs fare | `year_month` × `company` × `distance_bucket` |
 
 ---
 
-## Infrastructure & Deployment
+## Infrastructure
 
-The project uses **ECS Fargate** (ARM64/Graviton) to run the download job in AWS, with **GitHub Actions** for CI/CD. All infrastructure is defined as Terraform in `infra/`.
+All AWS resources are defined as Terraform in `infra/`. The pipeline is designed to stay within free-tier limits where possible.
 
-### AWS resources (free-tier optimised)
-
-| Resource | Purpose | Free tier note |
-|----------|---------|----------------|
-| **ECR** | Docker image registry | 500 MB storage |
-| **ECS Fargate** | Run download task (0.25 vCPU / 0.5 GB, ARM64) | 50 vCPU-hrs + 100 GB-hrs/month (12 months) |
-| **S3** | Store trip record parquets | 5 GB standard storage |
-| **CloudWatch Logs** | Task logs (7-day retention) | 5 GB ingestion |
+| Resource | Purpose |
+|---|---|
+| **ECS Fargate** (ARM64) | Run pipeline tasks (download, raw, trusted, 4× specialized) |
+| **ECR** | Docker image registry |
+| **S3** | Data storage (staging, raw, trusted, specialized) |
+| **Step Functions** | Orchestrate the full pipeline: download → raw → trusted → specialized (parallel) |
+| **Glue Data Catalog** | Table/partition metadata for Athena queries |
+| **CloudWatch Logs** | Task logs (7-day retention) |
+| **IAM** | Task roles, GitHub Actions OIDC, developer read access |
 
 ### First-time setup
 
@@ -184,24 +136,28 @@ terraform plan
 terraform apply
 ```
 
-After `terraform apply`, set the following GitHub repository secret:
+After `terraform apply`, set the following GitHub repository secrets:
 
 | Secret | Value (from Terraform output) |
-|--------|-------------------------------|
+|---|---|
 | `AWS_ROLE_ARN` | `github_actions_role_arn` |
+| `STATE_MACHINE_ARN` | `state_machine_arn` |
 
 ### CI/CD pipeline
 
-The GitHub Actions workflow (`.github/workflows/deploy.yml`) runs on every push to `main` that touches `app/`:
+The GitHub Actions workflow (`.github/workflows/deploy.yml`) runs on every push to `main` that touches `app/`, `reference/`, or the workflow itself:
 
 1. **build-and-push** — Builds the ARM64 Docker image and pushes to ECR
-2. **deploy** — Registers a new ECS task definition revision with the updated image
-3. **run-task** *(manual only)* — Triggers the Fargate task via `workflow_dispatch` with configurable `start_month` / `end_month`
+2. **deploy** — Registers new ECS task definition revisions (7 task families) with the updated image
+3. **run-pipeline** *(manual only)* — Starts the Step Functions pipeline via `workflow_dispatch` with configurable `start_month` / `end_month`
 
 ---
 
-## Setup
+## Local development
 
-- **Python:** 3.x
-- **App dependencies:** `pip install -r app/src/requirements.txt` (includes `duckdb` for raw layer build)
-- **Notebook dependencies:** `pip install -r notebooks/requirements.txt`
+**Python:** 3.12+
+
+```bash
+pip install -r app/src/requirements.txt      # pipeline dependencies
+pip install -r notebooks/requirements.txt    # notebook dependencies (optional)
+```

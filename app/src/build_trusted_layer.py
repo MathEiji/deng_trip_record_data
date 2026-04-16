@@ -5,31 +5,23 @@
 # GLUE_DATABASE          – Glue database name  (default: "trip_record_data")
 # AWS_REGION             – AWS region          (default: "us-east-1")
 
-import logging
 import os
 import sys
 import time
 from pathlib import Path
 
-import boto3
 import duckdb
 
 from common.pipeline import (
     cleanup_duckdb,
+    configure_logging,
     ensure_glue_database,
-    glue_columns_from_parquet,
     init_duckdb,
-    month_range,
-    register_glue_partitions,
-    upsert_glue_table,
+    parse_base_env,
+    register_hive_table,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-log = logging.getLogger(__name__)
+log = configure_logging(__name__)
 
 DB_PATH = Path("/tmp/_build_trusted.duckdb")
 
@@ -234,75 +226,43 @@ def register_trusted_table(
 
     ensure_glue_database(glue_client, database)
 
-    glob = f"{s3_dir}/**/*.parquet"
     s3_location = f"s3://{bucket}/{trusted_prefix}/trusted_trips/"
-    columns = glue_columns_from_parquet(
-        con, glob, hive_partitioning=True, exclude={"year_month"},
+    register_hive_table(
+        con, glue_client, database, "trusted_trips",
+        "Trusted layer: denormalized, cleaned trip data",
+        s3_dir, s3_location, year_months,
     )
-    partition_keys = [{"Name": "year_month", "Type": "int"}]
-
-    action = upsert_glue_table(
-        glue_client, database, "trusted_trips", s3_location,
-        columns, "Trusted layer: denormalized, cleaned trip data",
-        partition_keys,
-    )
-    log.info(
-        "  [%s] %s.trusted_trips (%d cols) -> %s",
-        action, database, len(columns), s3_location,
-    )
-
-    n_parts = register_glue_partitions(
-        glue_client, database, "trusted_trips",
-        s3_location, columns, year_months,
-    )
-    log.info("         %d partition(s) registered", n_parts)
 
 
 def main() -> None:
     t_start = time.time()
+    env = parse_base_env()
 
-    bucket = os.environ.get("S3_BUCKET")
-    start = os.environ.get("START_MONTH")
-    end = os.environ.get("END_MONTH")
     raw_prefix = os.environ.get("S3_RAW_PREFIX", "raw").strip("/")
     trusted_prefix = os.environ.get("S3_TRUSTED_PREFIX", "trusted").strip("/")
-    glue_database = os.environ.get("GLUE_DATABASE", "trip_record_data")
-    region = os.environ.get("AWS_REGION", "us-east-1")
-
-    if not bucket:
-        log.error("S3_BUCKET is required")
-        sys.exit(1)
-    if not start or not end:
-        log.error("START_MONTH and END_MONTH are required")
-        sys.exit(1)
-
-    months = month_range(start, end)
-    year_months = [int(ym.replace("-", "")) for ym in months]
-    year_months_csv = ", ".join(str(ym) for ym in year_months)
-    glue_client = boto3.client("glue", region_name=region)
 
     log.info("=" * 70)
     log.info("TRUSTED LAYER BUILD")
-    log.info("  Months        : %s -> %s (%d)", start, end, len(months))
-    log.info("  Raw input     : s3://%s/%s/", bucket, raw_prefix)
-    log.info("  Trusted output: s3://%s/%s/", bucket, trusted_prefix)
-    log.info("  Glue database : %s", glue_database)
+    log.info("  Months        : %s -> %s (%d)", env.start_month, env.end_month, len(env.months))
+    log.info("  Raw input     : s3://%s/%s/", env.bucket, raw_prefix)
+    log.info("  Trusted output: s3://%s/%s/", env.bucket, trusted_prefix)
+    log.info("  Glue database : %s", env.glue_database)
     log.info("=" * 70)
 
-    con = init_duckdb(DB_PATH, region, memory_limit="3GB")
+    con = init_duckdb(DB_PATH, env.region, memory_limit="3GB")
 
     try:
         log.info("Creating source views …")
-        create_source_views(con, bucket, raw_prefix, year_months_csv)
+        create_source_views(con, env.bucket, raw_prefix, env.year_months_csv)
 
         s3_dir, raw_count, trusted_count = build_trusted_trips(
-            con, bucket, trusted_prefix,
+            con, env.bucket, trusted_prefix,
         )
         ok = validate_trusted(con, s3_dir, trusted_count)
 
         register_trusted_table(
-            con, glue_client, glue_database,
-            s3_dir, bucket, trusted_prefix, year_months,
+            con, env.glue_client, env.glue_database,
+            s3_dir, env.bucket, trusted_prefix, env.year_months,
         )
     finally:
         con.close()
@@ -316,8 +276,8 @@ def main() -> None:
     log.info("  Raw rows      : %s", f"{raw_count:,}")
     log.info("  Trusted rows  : %s", f"{trusted_count:,}")
     log.info("  Filtered      : %s", f"{raw_count - trusted_count:,}")
-    log.info("  Output        : s3://%s/%s/trusted_trips/", bucket, trusted_prefix)
-    log.info("  Glue table    : %s.trusted_trips", glue_database)
+    log.info("  Output        : s3://%s/%s/trusted_trips/", env.bucket, trusted_prefix)
+    log.info("  Glue table    : %s.trusted_trips", env.glue_database)
     log.info("=" * 70)
 
     if not ok:

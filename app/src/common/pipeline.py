@@ -1,16 +1,76 @@
 """Shared infrastructure for all pipeline layers (raw, trusted, specialized).
 
 Provides DuckDB lifecycle, Glue Data Catalog helpers, month range
-utilities, and common constants. Zero business logic — just tooling.
+utilities, environment parsing, and common constants.
 """
 
 import logging
+import os
+import sys
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import boto3
 import duckdb
 
 log = logging.getLogger(__name__)
+
+
+def configure_logging(name: str = __name__) -> logging.Logger:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    return logging.getLogger(name)
+
+
+@dataclass
+class BaseEnv:
+    """Common environment variables shared by every pipeline layer."""
+    bucket: str
+    start_month: str
+    end_month: str
+    region: str
+    glue_database: str
+    months: list[str]
+    year_months: list[int]
+    year_months_csv: str
+    glue_client: object = field(repr=False)
+
+
+def parse_base_env() -> BaseEnv:
+    """Parse and validate the env vars every layer needs."""
+    bucket = os.environ.get("S3_BUCKET")
+    start = os.environ.get("START_MONTH")
+    end = os.environ.get("END_MONTH")
+    glue_database = os.environ.get("GLUE_DATABASE", "trip_record_data")
+    region = os.environ.get("AWS_REGION", "us-east-1")
+
+    if not bucket:
+        log.error("S3_BUCKET is required")
+        sys.exit(1)
+    if not start or not end:
+        log.error("START_MONTH and END_MONTH are required")
+        sys.exit(1)
+
+    months = month_range(start, end)
+    year_months = [int(ym.replace("-", "")) for ym in months]
+    year_months_csv = ", ".join(str(ym) for ym in year_months)
+    glue_client = boto3.client("glue", region_name=region)
+
+    return BaseEnv(
+        bucket=bucket,
+        start_month=start,
+        end_month=end,
+        region=region,
+        glue_database=glue_database,
+        months=months,
+        year_months=year_months,
+        year_months_csv=year_months_csv,
+        glue_client=glue_client,
+    )
 
 DUCKDB_TO_GLUE_TYPE = {
     "VARCHAR": "string",
@@ -208,3 +268,37 @@ def ensure_glue_database(glue_client, database: str) -> None:
         log.info("Created Glue database: %s", database)
     except glue_client.exceptions.AlreadyExistsException:
         log.info("Glue database exists: %s", database)
+
+
+def register_hive_table(
+    con: duckdb.DuckDBPyConnection,
+    glue_client,
+    database: str,
+    table_name: str,
+    description: str,
+    s3_dir: str,
+    s3_location: str,
+    year_months: list[int],
+) -> None:
+    """Register a single Hive-partitioned table + its partitions in Glue."""
+    s3_glob = f"{s3_dir}/**/*.parquet"
+    columns = glue_columns_from_parquet(
+        con, s3_glob, hive_partitioning=True, exclude={"year_month"},
+    )
+    partition_keys = [{"Name": "year_month", "Type": "int"}]
+
+    action = upsert_glue_table(
+        glue_client, database, table_name,
+        s3_location, columns, description,
+        partition_keys=partition_keys,
+    )
+    log.info(
+        "  [%s] %s.%-25s (%d cols) -> %s",
+        action, database, table_name, len(columns), s3_location,
+    )
+
+    n_parts = register_glue_partitions(
+        glue_client, database, table_name,
+        s3_location, columns, year_months,
+    )
+    log.info("    %d partition(s) registered", n_parts)

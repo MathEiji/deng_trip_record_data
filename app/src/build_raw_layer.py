@@ -6,7 +6,6 @@
 # AWS_REGION             – AWS region          (default: "us-east-1")
 # SKIP_QUALITY_ANALYSIS  – "true" to skip profiling
 
-import logging
 import os
 import sys
 import time
@@ -16,22 +15,17 @@ import boto3
 import duckdb
 
 from common.pipeline import (
-    PARQUET_SERDE,
     cleanup_duckdb,
+    configure_logging,
     ensure_glue_database,
     glue_columns_from_parquet,
     init_duckdb,
-    month_range,
-    register_glue_partitions,
+    parse_base_env,
+    register_hive_table,
     upsert_glue_table,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-log = logging.getLogger(__name__)
+log = configure_logging(__name__)
 
 RAW_TABLE_COLUMNS = {
     "raw_dispatch_base": [
@@ -363,84 +357,54 @@ def register_glue_tables(
     ensure_glue_database(glue_client, database)
 
     for table_name, s3_path in table_paths.items():
-        is_raw = table_name in RAW_TABLE_COLUMNS
         s3_location = f"s3://{bucket}/{raw_prefix}/{table_name}/"
 
-        if is_raw:
-            glob_path = f"{s3_path}/**/*.parquet"
-            columns = glue_columns_from_parquet(
-                con, glob_path,
-                hive_partitioning=True,
-                exclude={"year_month"},
+        if table_name in RAW_TABLE_COLUMNS:
+            register_hive_table(
+                con, glue_client, database, table_name,
+                f"Raw layer: {table_name}",
+                s3_path, s3_location, year_months,
             )
-            partition_keys = [{"Name": "year_month", "Type": "int"}]
         else:
             columns = glue_columns_from_parquet(con, s3_path)
-            partition_keys = None
-
-        action = upsert_glue_table(
-            glue_client, database, table_name, s3_location,
-            columns, f"Raw layer table: {table_name}",
-            partition_keys,
-        )
-        log.info(
-            "  [%s] %s.%-25s (%d cols) -> %s",
-            action, database, table_name, len(columns), s3_location,
-        )
-
-        if is_raw and year_months:
-            n_parts = register_glue_partitions(
-                glue_client, database, table_name,
-                s3_location, columns, year_months,
+            action = upsert_glue_table(
+                glue_client, database, table_name, s3_location,
+                columns, f"Dimension: {table_name}",
             )
             log.info(
-                "         %d partition(s) registered", n_parts,
+                "  [%s] %s.%-25s (%d cols) -> %s",
+                action, database, table_name, len(columns), s3_location,
             )
 
 
 def main() -> None:
     t_start = time.time()
+    env = parse_base_env()
 
-    bucket = os.environ.get("S3_BUCKET")
-    start = os.environ.get("START_MONTH")
-    end = os.environ.get("END_MONTH")
     staging_prefix = os.environ.get("S3_STAGING_PREFIX", "staging").strip("/")
     raw_prefix = os.environ.get("S3_RAW_PREFIX", "raw").strip("/")
-    glue_database = os.environ.get("GLUE_DATABASE", "trip_record_data")
-    region = os.environ.get("AWS_REGION", "us-east-1")
     skip_qa = os.environ.get("SKIP_QUALITY_ANALYSIS", "").lower() == "true"
 
-    if not bucket:
-        log.error("S3_BUCKET is required (set via environment variable)")
-        sys.exit(1)
-    if not start or not end:
-        log.error("START_MONTH and END_MONTH are required (set via environment variables)")
-        sys.exit(1)
-
-    months = month_range(start, end)
-    year_months = [int(ym.replace("-", "")) for ym in months]
-    s3_client = boto3.client("s3", region_name=region)
-    glue_client = boto3.client("glue", region_name=region)
-
-    s3_paths = staging_s3_paths(bucket, staging_prefix, months)
+    s3_client = boto3.client("s3", region_name=env.region)
+    s3_paths = staging_s3_paths(env.bucket, staging_prefix, env.months)
     paths_lit = staging_paths_sql(s3_paths)
 
     log.info("=" * 70)
     log.info("RAW LAYER BUILD")
-    log.info("  Months        : %s → %s (%d file(s))", start, end, len(months))
-    log.info("  Partitions    : %s", ", ".join(str(ym) for ym in year_months))
-    log.info("  Staging       : s3://%s/%s/", bucket, staging_prefix)
-    log.info("  Output        : s3://%s/%s/", bucket, raw_prefix)
-    log.info("  Glue database : %s", glue_database)
+    log.info("  Months        : %s → %s (%d file(s))", env.start_month, env.end_month, len(env.months))
+    log.info("  Partitions    : %s", ", ".join(str(ym) for ym in env.year_months))
+    log.info("  Staging       : s3://%s/%s/", env.bucket, staging_prefix)
+    log.info("  Output        : s3://%s/%s/", env.bucket, raw_prefix)
+    log.info("  Glue database : %s", env.glue_database)
     log.info("=" * 70)
 
-    files = verify_staging_files(s3_client, bucket, s3_paths)
+    files = verify_staging_files(s3_client, env.bucket, s3_paths)
     log.info("%d staging file(s) verified:", len(files))
     for f in files:
         size_mb = f["Size"] / (1024 * 1024)
         log.info("  %s  (%.0f MB)", f["Key"], size_mb)
 
-    con = init_duckdb(DB_PATH, region)
+    con = init_duckdb(DB_PATH, env.region)
 
     try:
         if skip_qa:
@@ -453,16 +417,16 @@ def main() -> None:
             total_rows = analyze_data_quality(con, paths_lit)
 
         raw_paths = build_raw_tables(
-            con, paths_lit, total_rows, bucket, raw_prefix,
+            con, paths_lit, total_rows, env.bucket, raw_prefix,
         )
-        dim_paths = build_dimension_tables(con, bucket, raw_prefix)
+        dim_paths = build_dimension_tables(con, env.bucket, raw_prefix)
 
         all_paths = {**raw_paths, **dim_paths}
-        ok = validate_raw_layer(con, total_rows, all_paths, year_months)
+        ok = validate_raw_layer(con, total_rows, all_paths, env.year_months)
 
         register_glue_tables(
-            con, glue_client, glue_database, all_paths,
-            bucket, raw_prefix, year_months,
+            con, env.glue_client, env.glue_database, all_paths,
+            env.bucket, raw_prefix, env.year_months,
         )
     finally:
         con.close()
@@ -473,12 +437,12 @@ def main() -> None:
     status = "BUILD COMPLETE" if ok else "BUILD COMPLETED WITH WARNINGS"
     log.info(status)
     log.info("  Total time : %.1fs", elapsed)
-    log.info("  Months     : %s → %s", start, end)
+    log.info("  Months     : %s → %s", env.start_month, env.end_month)
     log.info("  Total rows : %s", f"{total_rows:,}")
     log.info("  Raw tables : %d", len(RAW_TABLE_COLUMNS))
     log.info("  Dimensions : %d", len(dim_paths))
-    log.info("  Output     : s3://%s/%s/", bucket, raw_prefix)
-    log.info("  Glue DB    : %s", glue_database)
+    log.info("  Output     : s3://%s/%s/", env.bucket, raw_prefix)
+    log.info("  Glue DB    : %s", env.glue_database)
     log.info("=" * 70)
 
     if not ok:

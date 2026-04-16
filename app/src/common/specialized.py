@@ -3,31 +3,23 @@
 Provides the build/validate/register lifecycle via ``run()``.
 """
 
-import logging
 import os
 import sys
 import time
 from pathlib import Path
 
-import boto3
 import duckdb
 
 from common.pipeline import (
     cleanup_duckdb,
+    configure_logging,
     ensure_glue_database,
-    glue_columns_from_parquet,
     init_duckdb,
-    month_range,
-    register_glue_partitions,
-    upsert_glue_table,
+    parse_base_env,
+    register_hive_table,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-log = logging.getLogger("specialized")
+log = configure_logging("specialized")
 
 DB_PATH = Path("/tmp/_build_specialized.duckdb")
 
@@ -120,47 +112,6 @@ def _validate(
     return all_ok
 
 
-def _register_glue(
-    con: duckdb.DuckDBPyConnection,
-    glue_client,
-    database: str,
-    table_name: str,
-    description: str,
-    s3_dir: str,
-    bucket: str,
-    spec_prefix: str,
-    year_months: list[int],
-) -> None:
-    log.info("=" * 70)
-    log.info("GLUE DATA CATALOG REGISTRATION")
-    log.info("=" * 70)
-
-    ensure_glue_database(glue_client, database)
-
-    partition_keys = [{"Name": "year_month", "Type": "int"}]
-    s3_location = f"s3://{bucket}/{spec_prefix}/{table_name}/"
-    s3_glob = f"{s3_dir}/**/*.parquet"
-    columns = glue_columns_from_parquet(
-        con, s3_glob, hive_partitioning=True, exclude={"year_month"},
-    )
-
-    action = upsert_glue_table(
-        glue_client, database, table_name,
-        s3_location, columns, description,
-        partition_keys=partition_keys,
-    )
-    log.info(
-        "  [%s] %s.%-25s (%d cols) -> %s",
-        action, database, table_name, len(columns), s3_location,
-    )
-
-    n_parts = register_glue_partitions(
-        glue_client, database, table_name,
-        s3_location, columns, year_months,
-    )
-    log.info("    %d partition(s) registered", n_parts)
-
-
 def run(
     *,
     table_name: str,
@@ -170,57 +121,47 @@ def run(
 ) -> None:
     """Full lifecycle: read config, build, validate, register in Glue."""
     t_start = time.time()
+    env = parse_base_env()
 
-    bucket = os.environ.get("S3_BUCKET")
-    start = os.environ.get("START_MONTH")
-    end = os.environ.get("END_MONTH")
     trusted_prefix = os.environ.get("S3_TRUSTED_PREFIX", "trusted").strip("/")
     spec_prefix = os.environ.get("S3_SPECIALIZED_PREFIX", "specialized").strip("/")
-    glue_database = os.environ.get("GLUE_DATABASE", "trip_record_data")
-    region = os.environ.get("AWS_REGION", "us-east-1")
-
-    if not bucket:
-        log.error("S3_BUCKET is required")
-        sys.exit(1)
-    if not start or not end:
-        log.error("START_MONTH and END_MONTH are required")
-        sys.exit(1)
-
-    months = month_range(start, end)
-    year_months = [int(ym.replace("-", "")) for ym in months]
-    year_months_csv = ", ".join(str(ym) for ym in year_months)
-    glue_client = boto3.client("glue", region_name=region)
 
     log.info("=" * 70)
     log.info("SPECIALIZED LAYER BUILD")
     log.info("  Table           : %s", table_name)
-    log.info("  Months          : %s -> %s (%d)", start, end, len(months))
-    log.info("  Trusted input   : s3://%s/%s/", bucket, trusted_prefix)
-    log.info("  Specialized out : s3://%s/%s/", bucket, spec_prefix)
-    log.info("  Glue database   : %s", glue_database)
+    log.info("  Months          : %s -> %s (%d)", env.start_month, env.end_month, len(env.months))
+    log.info("  Trusted input   : s3://%s/%s/", env.bucket, trusted_prefix)
+    log.info("  Specialized out : s3://%s/%s/", env.bucket, spec_prefix)
+    log.info("  Glue database   : %s", env.glue_database)
     log.info("=" * 70)
 
-    con = init_duckdb(DB_PATH, region)
+    con = init_duckdb(DB_PATH, env.region)
 
     try:
         log.info("Creating trusted view …")
         trusted_count = _create_trusted_view(
-            con, bucket, trusted_prefix, year_months_csv,
+            con, env.bucket, trusted_prefix, env.year_months_csv,
         )
 
         s3_dir, row_count = _build(
-            con, bucket, spec_prefix, table_name, sql,
+            con, env.bucket, spec_prefix, table_name, sql,
         )
         ok = _validate(
             con, table_name, s3_dir, row_count,
-            trusted_count, year_months,
+            trusted_count, env.year_months,
             has_trip_count=has_trip_count,
         )
 
-        _register_glue(
-            con, glue_client, glue_database,
-            table_name, description, s3_dir,
-            bucket, spec_prefix, year_months,
+        log.info("=" * 70)
+        log.info("GLUE DATA CATALOG REGISTRATION")
+        log.info("=" * 70)
+
+        ensure_glue_database(env.glue_client, env.glue_database)
+
+        s3_location = f"s3://{env.bucket}/{spec_prefix}/{table_name}/"
+        register_hive_table(
+            con, env.glue_client, env.glue_database, table_name,
+            description, s3_dir, s3_location, env.year_months,
         )
     finally:
         con.close()
@@ -234,7 +175,7 @@ def run(
     log.info("  Total time : %.1fs", elapsed)
     log.info("  Input rows : %s", f"{trusted_count:,}")
     log.info("  Output     : %s/", s3_dir)
-    log.info("  Glue DB    : %s", glue_database)
+    log.info("  Glue DB    : %s", env.glue_database)
     log.info("=" * 70)
 
     if not ok:
