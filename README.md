@@ -4,6 +4,7 @@
 
 **Disciplina:** Engenharia de Dados — USP PECE Poli  
 **Grupo:**
+- Matheus Eiji
 - Leandro Sousa
 - Caio Ribeiro
 - João Albino
@@ -290,6 +291,7 @@ con.execute("SELECT * FROM read_parquet('data/raw/raw_fare_payment.parquet') LIM
 
 | Nome | Usuário IAM |
 |------|-------------|
+| Matheus Eiji | — |
 | Leandro Sousa | `leandro.sousa` |
 | Caio Ribeiro | `caio.ribeiro` |
 | João Albino | `joao.albino` |
