@@ -1,40 +1,31 @@
-"""Build the RAW layer from staging FHVHV trip data stored in S3.
+# S3_BUCKET              – bucket for input/output (required)
+# START_MONTH / END_MONTH – YYYY-MM range (required)
+# S3_STAGING_PREFIX      – staging key prefix  (default: "staging")
+# S3_RAW_PREFIX          – raw output prefix   (default: "raw")
+# GLUE_DATABASE          – Glue database name  (default: "trip_record_data")
+# AWS_REGION             – AWS region          (default: "us-east-1")
+# SKIP_QUALITY_ANALYSIS  – "true" to skip profiling
 
-Reads staging parquet files from S3 via DuckDB httpfs, runs data quality
-analysis, splits the monolithic schema into context-based raw tables,
-writes them back to S3, and registers every table in the AWS Glue Data
-Catalog so they're immediately queryable from Athena / Spark / Redshift
-Spectrum.
-
-Designed to run inside an ECS Fargate task.  Configuration is read from
-environment variables:
-
-    S3_BUCKET              – S3 bucket for input and output (required)
-    S3_STAGING_PREFIX      – key prefix for staging parquets (default: "staging")
-    S3_RAW_PREFIX          – key prefix for raw output       (default: "raw")
-    GLUE_DATABASE          – Glue catalog database name      (default: "trip_record_data")
-    AWS_REGION             – AWS region                      (default: "us-east-1")
-    SKIP_QUALITY_ANALYSIS  – set "true" to skip the profiling step
-"""
-
-import logging
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import boto3
 import duckdb
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
+from common.pipeline import (
+    cleanup_duckdb,
+    configure_logging,
+    ensure_glue_database,
+    glue_columns_from_parquet,
+    init_duckdb,
+    parse_base_env,
+    register_hive_table,
+    upsert_glue_table,
 )
-log = logging.getLogger(__name__)
 
-# ── Table definitions ────────────────────────────────────────────────────
+log = configure_logging(__name__)
 
 RAW_TABLE_COLUMNS = {
     "raw_dispatch_base": [
@@ -74,32 +65,10 @@ RAW_TABLE_COLUMNS = {
 
 DIMENSION_TABLES = ["dim_hvfhs_license", "dim_base"]
 
-DUCKDB_TO_GLUE_TYPE = {
-    "VARCHAR": "string",
-    "BIGINT": "bigint",
-    "INTEGER": "int",
-    "SMALLINT": "smallint",
-    "TINYINT": "tinyint",
-    "DOUBLE": "double",
-    "FLOAT": "float",
-    "REAL": "float",
-    "TIMESTAMP": "timestamp",
-    "TIMESTAMP WITH TIME ZONE": "timestamp",
-    "TIMESTAMP_S": "timestamp",
-    "TIMESTAMP_MS": "timestamp",
-    "TIMESTAMP_NS": "timestamp",
-    "DATE": "date",
-    "BOOLEAN": "boolean",
-    "BLOB": "binary",
-}
-
 DB_PATH = Path("/tmp/_build_raw.duckdb")
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-
 def _find_reference_dir() -> Path:
-    """Locate the reference/ directory (works both in Docker and local dev)."""
     script_dir = Path(__file__).resolve().parent
     for ancestor in (script_dir.parent, script_dir.parent.parent):
         candidate = ancestor / "reference"
@@ -108,67 +77,57 @@ def _find_reference_dir() -> Path:
     return script_dir.parent / "reference"
 
 
-def init_duckdb(region: str) -> duckdb.DuckDBPyConnection:
-    """Create a DuckDB connection with S3 via IAM credential chain.
-
-    Uses a persistent on-disk database so DuckDB can spill large
-    intermediates to the container's ephemeral storage.
-    """
-    con = duckdb.connect(str(DB_PATH))
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute("INSTALL aws; LOAD aws;")
-    con.execute(f"SET s3_region = '{region}';")
-    con.execute("CREATE SECRET (TYPE S3, PROVIDER CREDENTIAL_CHAIN);")
-    return con
+def staging_s3_paths(
+    bucket: str, prefix: str, months: list[str],
+) -> list[str]:
+    return [
+        f"s3://{bucket}/{prefix}/fhvhv_tripdata_{ym}.parquet"
+        for ym in months
+    ]
 
 
-def cleanup_duckdb() -> None:
-    for p in (DB_PATH, DB_PATH.with_suffix(".duckdb.wal")):
-        if p.exists():
-            p.unlink()
+def staging_paths_sql(paths: list[str]) -> str:
+    inner = ", ".join(f"'{p}'" for p in paths)
+    return f"[{inner}]"
 
 
-def staging_glob(bucket: str, prefix: str) -> str:
-    return f"s3://{bucket}/{prefix}/fhvhv_tripdata_*.parquet"
-
-
-# ── Discovery ────────────────────────────────────────────────────────────
-
-def discover_staging_files(
-    s3_client, bucket: str, prefix: str,
+def verify_staging_files(
+    s3_client, bucket: str, paths: list[str],
 ) -> list[dict]:
-    """List staging parquet files in S3.  Returns [{"Key": ..., "Size": ...}]."""
-    paginator = s3_client.get_paginator("list_objects_v2")
-    files = []
-    for page in paginator.paginate(
-        Bucket=bucket, Prefix=f"{prefix}/fhvhv_tripdata_",
-    ):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
-                files.append({"Key": obj["Key"], "Size": obj["Size"]})
-    if not files:
-        log.error("No staging files found at s3://%s/%s/", bucket, prefix)
+    files: list[dict] = []
+    missing: list[str] = []
+
+    for uri in paths:
+        key = uri.split(f"s3://{bucket}/", 1)[1]
+        try:
+            resp = s3_client.head_object(Bucket=bucket, Key=key)
+            files.append({"Key": key, "Size": resp["ContentLength"]})
+        except s3_client.exceptions.ClientError:
+            missing.append(uri)
+
+    if missing:
+        log.error("Staging files not found in S3:")
+        for m in missing:
+            log.error("  %s", m)
         sys.exit(1)
-    return sorted(files, key=lambda x: x["Key"])
 
+    return files
 
-# ── Data quality ─────────────────────────────────────────────────────────
 
 def analyze_data_quality(
-    con: duckdb.DuckDBPyConnection, glob: str,
+    con: duckdb.DuckDBPyConnection, paths_lit: str,
 ) -> int:
-    """Profile the staging data and return total row count."""
     log.info("=" * 70)
     log.info("DATA QUALITY ANALYSIS")
     log.info("=" * 70)
 
     schema = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{glob}')"
+        f"DESCRIBE SELECT * FROM read_parquet({paths_lit})"
     ).fetchall()
 
     file_counts = con.execute(f"""
         SELECT filename, count(*) AS n
-        FROM read_parquet('{glob}', filename=true)
+        FROM read_parquet({paths_lit}, filename=true)
         GROUP BY filename ORDER BY filename
     """).fetchall()
 
@@ -177,13 +136,12 @@ def analyze_data_quality(
     for fname, n in file_counts:
         log.info("  %40s  %14s", Path(fname).name, f"{n:,}")
 
-    # Null analysis
     null_exprs = ", ".join(
         f'SUM(CASE WHEN "{col[0]}" IS NULL THEN 1 ELSE 0 END)'
         for col in schema
     )
     null_result = con.execute(
-        f"SELECT {null_exprs} FROM read_parquet('{glob}')"
+        f"SELECT {null_exprs} FROM read_parquet({paths_lit})"
     ).fetchone()
 
     log.info("Null analysis:")
@@ -197,7 +155,6 @@ def analyze_data_quality(
     if not found_nulls:
         log.info("  No null values found.")
 
-    # Numeric statistics
     numeric_cols = [
         col[0]
         for col in schema
@@ -209,7 +166,7 @@ def analyze_data_quality(
             for c in numeric_cols
         )
         stats = con.execute(
-            f"SELECT {stat_exprs} FROM read_parquet('{glob}')"
+            f"SELECT {stat_exprs} FROM read_parquet({paths_lit})"
         ).fetchone()
 
         log.info("Numeric column statistics:")
@@ -220,12 +177,11 @@ def analyze_data_quality(
                 col_name, mn, avg, mx, sd,
             )
 
-    # Categorical distributions
     categorical_cols = [col[0] for col in schema if col[1] == "VARCHAR"]
     for col_name in categorical_cols:
         dist = con.execute(f"""
             SELECT "{col_name}", count(*) AS n
-            FROM read_parquet('{glob}')
+            FROM read_parquet({paths_lit})
             WHERE "{col_name}" IS NOT NULL
             GROUP BY "{col_name}"
             ORDER BY n DESC
@@ -241,20 +197,13 @@ def analyze_data_quality(
     return total_rows
 
 
-# ── Raw table build ──────────────────────────────────────────────────────
-
 def build_raw_tables(
     con: duckdb.DuckDBPyConnection,
-    glob: str,
+    paths_lit: str,
     total_rows: int,
-    processed_date: str,
     bucket: str,
     raw_prefix: str,
 ) -> dict[str, str]:
-    """Materialize staging with trip_id, split into raw tables on S3.
-
-    Returns ``{table_name: s3_parquet_path}``.
-    """
     log.info("=" * 70)
     log.info("BUILDING RAW LAYER")
     log.info("=" * 70)
@@ -265,9 +214,13 @@ def build_raw_tables(
         CREATE OR REPLACE TABLE staging_full AS
         SELECT
             (row_number() OVER ()) - 1 AS trip_id,
-            '{processed_date}'         AS processed_date,
-            *
-        FROM read_parquet('{glob}')
+            current_timestamp AS processed_date,
+            CAST(replace(
+                regexp_extract(filename, 'fhvhv_tripdata_(\\d{{4}}-\\d{{2}})', 1),
+                '-', ''
+            ) AS INTEGER) AS year_month,
+            * EXCLUDE (filename)
+        FROM read_parquet({paths_lit}, filename=true)
     """)
     log.info("  Done in %.1fs  (%s rows)", time.time() - t0, f"{total_rows:,}")
 
@@ -275,33 +228,27 @@ def build_raw_tables(
     for table_name, columns in RAW_TABLE_COLUMNS.items():
         t0 = time.time()
         cols_csv = ", ".join(f'"{c}"' for c in columns)
-        s3_path = f"s3://{bucket}/{raw_prefix}/{table_name}/{table_name}.parquet"
+        s3_dir = f"s3://{bucket}/{raw_prefix}/{table_name}"
 
         con.execute(f"""
             COPY (
-                SELECT trip_id, processed_date, {cols_csv}
+                SELECT trip_id, processed_date, year_month, {cols_csv}
                 FROM staging_full
-            ) TO '{s3_path}' (FORMAT PARQUET)
+            ) TO '{s3_dir}' (FORMAT PARQUET, PARTITION_BY (year_month), OVERWRITE_OR_IGNORE)
         """)
         elapsed = time.time() - t0
-        log.info("  %-30s -> %s  (%.1fs)", table_name, s3_path, elapsed)
-        table_paths[table_name] = s3_path
+        log.info("  %-30s -> %s/  (%.1fs)", table_name, s3_dir, elapsed)
+        table_paths[table_name] = s3_dir
 
     con.execute("DROP TABLE IF EXISTS staging_full")
     return table_paths
 
-
-# ── Dimension tables ─────────────────────────────────────────────────────
 
 def build_dimension_tables(
     con: duckdb.DuckDBPyConnection,
     bucket: str,
     raw_prefix: str,
 ) -> dict[str, str]:
-    """Convert bundled reference CSVs into parquet dimension tables on S3.
-
-    Returns ``{table_name: s3_parquet_path}``.
-    """
     log.info("Building dimension tables:")
     reference_dir = _find_reference_dir()
     table_paths: dict[str, str] = {}
@@ -328,25 +275,29 @@ def build_dimension_tables(
     return table_paths
 
 
-# ── Validation ───────────────────────────────────────────────────────────
-
 def validate_raw_layer(
     con: duckdb.DuckDBPyConnection,
     total_rows: int,
     table_paths: dict[str, str],
+    year_months: list[int],
 ) -> bool:
-    """Check row counts and join consistency across raw tables in S3."""
     log.info("=" * 70)
     log.info("VALIDATION")
     log.info("=" * 70)
 
     all_ok = True
+    ym_csv = ", ".join(str(ym) for ym in year_months)
+
+    def _raw_glob(s3_dir: str) -> str:
+        return f"{s3_dir}/**/*.parquet"
 
     for table_name in RAW_TABLE_COLUMNS:
-        s3_path = table_paths[table_name]
-        n = con.execute(
-            f"SELECT count(*) FROM read_parquet('{s3_path}')"
-        ).fetchone()[0]
+        s3_dir = table_paths[table_name]
+        n = con.execute(f"""
+            SELECT count(*)
+            FROM read_parquet('{_raw_glob(s3_dir)}', hive_partitioning=true)
+            WHERE year_month IN ({ym_csv})
+        """).fetchone()[0]
         ok = n == total_rows
         if not ok:
             all_ok = False
@@ -364,19 +315,19 @@ def validate_raw_layer(
                 all_ok = False
             log.info("  [%s] %-30s %14s rows", tag, dim_name, f"{n:,}")
 
-    # Join consistency on a sample
     sample = min(100_000, total_rows)
-    rp = {name: table_paths[name] for name in RAW_TABLE_COLUMNS}
+    rp = {name: _raw_glob(table_paths[name]) for name in RAW_TABLE_COLUMNS}
     joined = con.execute(f"""
         SELECT count(*)
-        FROM read_parquet('{rp["raw_dispatch_base"]}') d
-        JOIN read_parquet('{rp["raw_trip_time_location"]}') t
-             ON d.trip_id = t.trip_id
-        JOIN read_parquet('{rp["raw_fare_payment"]}') f
-             ON d.trip_id = f.trip_id
-        JOIN read_parquet('{rp["raw_request_flags"]}') r
-             ON d.trip_id = r.trip_id
-        WHERE d.trip_id < {sample}
+        FROM read_parquet('{rp["raw_dispatch_base"]}', hive_partitioning=true) d
+        JOIN read_parquet('{rp["raw_trip_time_location"]}', hive_partitioning=true) t
+             ON d.trip_id = t.trip_id AND d.year_month = t.year_month
+        JOIN read_parquet('{rp["raw_fare_payment"]}', hive_partitioning=true) f
+             ON d.trip_id = f.trip_id AND d.year_month = f.year_month
+        JOIN read_parquet('{rp["raw_request_flags"]}', hive_partitioning=true) r
+             ON d.trip_id = r.trip_id AND d.year_month = r.year_month
+        WHERE d.year_month IN ({ym_csv})
+          AND d.trip_id < {sample}
     """).fetchone()[0]
     ok = joined == sample
     if not ok:
@@ -390,72 +341,6 @@ def validate_raw_layer(
     return all_ok
 
 
-# ── Glue Data Catalog ────────────────────────────────────────────────────
-
-def _glue_columns_from_parquet(
-    con: duckdb.DuckDBPyConnection, s3_path: str,
-) -> list[dict]:
-    """Derive Glue-compatible column definitions from an S3 parquet file."""
-    schema = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{s3_path}')"
-    ).fetchall()
-    return [
-        {
-            "Name": col_name,
-            "Type": DUCKDB_TO_GLUE_TYPE.get(col_type, "string"),
-        }
-        for col_name, col_type, *_ in schema
-    ]
-
-
-def _upsert_glue_table(
-    glue_client,
-    database: str,
-    table_name: str,
-    s3_location: str,
-    columns: list[dict],
-) -> str:
-    """Create or update a single Glue table. Returns 'created' or 'updated'."""
-    table_input = {
-        "Name": table_name,
-        "Description": f"Raw layer table: {table_name}",
-        "StorageDescriptor": {
-            "Columns": columns,
-            "Location": s3_location,
-            "InputFormat": (
-                "org.apache.hadoop.hive.ql.io.parquet"
-                ".MapredParquetInputFormat"
-            ),
-            "OutputFormat": (
-                "org.apache.hadoop.hive.ql.io.parquet"
-                ".MapredParquetOutputFormat"
-            ),
-            "SerdeInfo": {
-                "SerializationLibrary": (
-                    "org.apache.hadoop.hive.ql.io.parquet"
-                    ".serde.ParquetHiveSerDe"
-                ),
-            },
-        },
-        "TableType": "EXTERNAL_TABLE",
-        "Parameters": {
-            "classification": "parquet",
-            "typeOfData": "file",
-        },
-    }
-
-    try:
-        glue_client.update_table(
-            DatabaseName=database, TableInput=table_input,
-        )
-        return "updated"
-    except glue_client.exceptions.EntityNotFoundException:
-        glue_client.create_table(
-            DatabaseName=database, TableInput=table_input,
-        )
-        return "created"
-
-
 def register_glue_tables(
     con: duckdb.DuckDBPyConnection,
     glue_client,
@@ -463,108 +348,101 @@ def register_glue_tables(
     table_paths: dict[str, str],
     bucket: str,
     raw_prefix: str,
+    year_months: list[int],
 ) -> None:
-    """Register all raw and dimension tables in the Glue Data Catalog."""
     log.info("=" * 70)
     log.info("GLUE DATA CATALOG REGISTRATION")
     log.info("=" * 70)
 
-    try:
-        glue_client.create_database(
-            DatabaseInput={
-                "Name": database,
-                "Description": "NYC TLC FHVHV trip record data — raw layer",
-            }
-        )
-        log.info("Created Glue database: %s", database)
-    except glue_client.exceptions.AlreadyExistsException:
-        log.info("Glue database exists: %s", database)
+    ensure_glue_database(glue_client, database)
 
     for table_name, s3_path in table_paths.items():
-        columns = _glue_columns_from_parquet(con, s3_path)
         s3_location = f"s3://{bucket}/{raw_prefix}/{table_name}/"
 
-        action = _upsert_glue_table(
-            glue_client, database, table_name, s3_location, columns,
-        )
-        log.info(
-            "  [%s] %s.%-25s (%d cols) -> %s",
-            action, database, table_name, len(columns), s3_location,
-        )
+        if table_name in RAW_TABLE_COLUMNS:
+            register_hive_table(
+                con, glue_client, database, table_name,
+                f"Raw layer: {table_name}",
+                s3_path, s3_location, year_months,
+            )
+        else:
+            columns = glue_columns_from_parquet(con, s3_path)
+            action = upsert_glue_table(
+                glue_client, database, table_name, s3_location,
+                columns, f"Dimension: {table_name}",
+            )
+            log.info(
+                "  [%s] %s.%-25s (%d cols) -> %s",
+                action, database, table_name, len(columns), s3_location,
+            )
 
-
-# ── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
     t_start = time.time()
-    processed_date = datetime.now().strftime("%Y%m%d")
+    env = parse_base_env()
 
-    bucket = os.environ.get("S3_BUCKET")
     staging_prefix = os.environ.get("S3_STAGING_PREFIX", "staging").strip("/")
     raw_prefix = os.environ.get("S3_RAW_PREFIX", "raw").strip("/")
-    glue_database = os.environ.get("GLUE_DATABASE", "trip_record_data")
-    region = os.environ.get("AWS_REGION", "us-east-1")
     skip_qa = os.environ.get("SKIP_QUALITY_ANALYSIS", "").lower() == "true"
 
-    if not bucket:
-        log.error("S3_BUCKET is required (set via environment variable)")
-        sys.exit(1)
-
-    s3_client = boto3.client("s3", region_name=region)
-    glue_client = boto3.client("glue", region_name=region)
-    glob = staging_glob(bucket, staging_prefix)
+    s3_client = boto3.client("s3", region_name=env.region)
+    s3_paths = staging_s3_paths(env.bucket, staging_prefix, env.months)
+    paths_lit = staging_paths_sql(s3_paths)
 
     log.info("=" * 70)
     log.info("RAW LAYER BUILD")
-    log.info("  Staging       : s3://%s/%s/", bucket, staging_prefix)
-    log.info("  Output        : s3://%s/%s/", bucket, raw_prefix)
-    log.info("  Glue database : %s", glue_database)
-    log.info("  Processed date: %s", processed_date)
+    log.info("  Months        : %s → %s (%d file(s))", env.start_month, env.end_month, len(env.months))
+    log.info("  Partitions    : %s", ", ".join(str(ym) for ym in env.year_months))
+    log.info("  Staging       : s3://%s/%s/", env.bucket, staging_prefix)
+    log.info("  Output        : s3://%s/%s/", env.bucket, raw_prefix)
+    log.info("  Glue database : %s", env.glue_database)
     log.info("=" * 70)
 
-    files = discover_staging_files(s3_client, bucket, staging_prefix)
-    log.info("%d staging file(s) found:", len(files))
+    files = verify_staging_files(s3_client, env.bucket, s3_paths)
+    log.info("%d staging file(s) verified:", len(files))
     for f in files:
         size_mb = f["Size"] / (1024 * 1024)
         log.info("  %s  (%.0f MB)", f["Key"], size_mb)
 
-    con = init_duckdb(region)
+    con = init_duckdb(DB_PATH, env.region)
 
     try:
         if skip_qa:
             log.info("Skipping quality analysis (SKIP_QUALITY_ANALYSIS=true)")
             total_rows = con.execute(
-                f"SELECT count(*) FROM read_parquet('{glob}')"
+                f"SELECT count(*) FROM read_parquet({paths_lit})"
             ).fetchone()[0]
             log.info("Total staging rows: %s", f"{total_rows:,}")
         else:
-            total_rows = analyze_data_quality(con, glob)
+            total_rows = analyze_data_quality(con, paths_lit)
 
         raw_paths = build_raw_tables(
-            con, glob, total_rows, processed_date, bucket, raw_prefix,
+            con, paths_lit, total_rows, env.bucket, raw_prefix,
         )
-        dim_paths = build_dimension_tables(con, bucket, raw_prefix)
+        dim_paths = build_dimension_tables(con, env.bucket, raw_prefix)
 
         all_paths = {**raw_paths, **dim_paths}
-        ok = validate_raw_layer(con, total_rows, all_paths)
+        ok = validate_raw_layer(con, total_rows, all_paths, env.year_months)
 
         register_glue_tables(
-            con, glue_client, glue_database, all_paths, bucket, raw_prefix,
+            con, env.glue_client, env.glue_database, all_paths,
+            env.bucket, raw_prefix, env.year_months,
         )
     finally:
         con.close()
-        cleanup_duckdb()
+        cleanup_duckdb(DB_PATH)
 
     elapsed = time.time() - t_start
     log.info("=" * 70)
     status = "BUILD COMPLETE" if ok else "BUILD COMPLETED WITH WARNINGS"
     log.info(status)
     log.info("  Total time : %.1fs", elapsed)
+    log.info("  Months     : %s → %s", env.start_month, env.end_month)
     log.info("  Total rows : %s", f"{total_rows:,}")
     log.info("  Raw tables : %d", len(RAW_TABLE_COLUMNS))
     log.info("  Dimensions : %d", len(dim_paths))
-    log.info("  Output     : s3://%s/%s/", bucket, raw_prefix)
-    log.info("  Glue DB    : %s", glue_database)
+    log.info("  Output     : s3://%s/%s/", env.bucket, raw_prefix)
+    log.info("  Glue DB    : %s", env.glue_database)
     log.info("=" * 70)
 
     if not ok:

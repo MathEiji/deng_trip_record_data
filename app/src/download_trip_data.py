@@ -1,13 +1,7 @@
-"""Download FHVHV trip data parquet files from the NYC TLC CDN and upload to S3.
-
-Designed to run inside an ECS Fargate task.  Configuration is read from
-environment variables (with CLI fallback for local development):
-
-    S3_BUCKET     – target S3 bucket  (required)
-    S3_PREFIX     – key prefix inside the bucket  (default: "staging")
-    START_MONTH   – first month to download, YYYY-MM
-    END_MONTH     – last  month to download, YYYY-MM
-"""
+# S3_BUCKET     – target bucket (required)
+# S3_PREFIX     – key prefix    (default: "staging")
+# START_MONTH   – YYYY-MM
+# END_MONTH     – YYYY-MM
 
 import argparse
 import logging
@@ -30,7 +24,6 @@ MULTIPART_CHUNK = 8 * 1024 * 1024  # 8 MB
 
 
 def month_range(start: str, end: str) -> list[str]:
-    """Return a list of 'YYYY-MM' strings from *start* to *end* inclusive."""
     start_dt = datetime.strptime(start, "%Y-%m")
     end_dt = datetime.strptime(end, "%Y-%m")
     if start_dt > end_dt:
@@ -58,10 +51,7 @@ def s3_key_exists(s3_client, bucket: str, key: str) -> bool:
 def stream_to_s3(
     url: str, s3_client, bucket: str, key: str, timeout: int = 60
 ) -> int:
-    """Stream-download *url* and upload to S3 via multipart upload.
-
-    Returns the total number of bytes uploaded.
-    """
+    """Stream a remote file directly into S3 without buffering locally."""
     with requests.get(url, stream=True, timeout=timeout) as resp:
         resp.raise_for_status()
         content_length = int(resp.headers.get("content-length", 0))

@@ -10,20 +10,16 @@ on:
 
   workflow_dispatch:
     inputs:
-      run_task:
-        description: "Which ECS task to run after deploy"
-        type: choice
-        options:
-          - none
-          - download
-          - build_raw
-        default: "none"
+      run_pipeline:
+        description: "Run the Step Functions pipeline after deploy"
+        type: boolean
+        default: false
       start_month:
-        description: "Start month (YYYY-MM) — used by download task"
+        description: "Start month (YYYY-MM)"
         type: string
         default: "2025-01"
       end_month:
-        description: "End month (YYYY-MM) — used by download task"
+        description: "End month (YYYY-MM)"
         type: string
         default: "2025-06"
 
@@ -35,8 +31,15 @@ env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: trip-record-data
   ECS_CLUSTER: trip-record-data
-  DOWNLOAD_TASK_FAMILY: trip-record-data-download
-  BUILD_RAW_TASK_FAMILY: trip-record-data-build-raw
+  TASK_FAMILIES: >-
+    trip-record-data-download
+    trip-record-data-build-raw
+    trip-record-data-build-trusted
+    trip-record-data-build-spec-hourly-volume
+    trip-record-data-build-spec-daily-volume
+    trip-record-data-build-spec-trip-distance
+    trip-record-data-build-spec-distance-fare
+  STATE_MACHINE_ARN: ${{ secrets.STATE_MACHINE_ARN }}
 
 jobs:
   # ── Build Docker image and push to ECR ──────────────────────────
@@ -94,7 +97,7 @@ jobs:
         env:
           NEW_IMAGE: ${{ needs.build-and-push.outputs.image }}
         run: |
-          for FAMILY in "${DOWNLOAD_TASK_FAMILY}" "${BUILD_RAW_TASK_FAMILY}"; do
+          for FAMILY in ${TASK_FAMILIES}; do
             echo "Updating task definition: ${FAMILY}"
 
             TASK_DEF=$(aws ecs describe-task-definition \
@@ -120,11 +123,11 @@ jobs:
             echo "  -> Updated with image: ${NEW_IMAGE}"
           done
 
-  # ── Optionally run an ECS task (manual trigger only) ────────────
-  run-task:
+  # ── Optionally run the pipeline (manual trigger only) ────────────
+  run-pipeline:
     if: >-
       github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.run_task != 'none'
+      github.event.inputs.run_pipeline == 'true'
     needs: deploy
     runs-on: ubuntu-latest
     steps:
@@ -134,57 +137,29 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Run ECS Fargate task
+      - name: Start Step Functions pipeline
         run: |
-          if [ "${{ github.event.inputs.run_task }}" = "download" ]; then
-            FAMILY="${DOWNLOAD_TASK_FAMILY}"
-            CONTAINER_NAME="download-trip-data"
-            OVERRIDES="{
-              \"containerOverrides\": [{
-                \"name\": \"${CONTAINER_NAME}\",
-                \"environment\": [
-                  {\"name\": \"START_MONTH\", \"value\": \"${{ github.event.inputs.start_month }}\"},
-                  {\"name\": \"END_MONTH\",   \"value\": \"${{ github.event.inputs.end_month }}\"}
-                ]
-              }]
-            }"
-          else
-            FAMILY="${BUILD_RAW_TASK_FAMILY}"
-            CONTAINER_NAME="build-raw-layer"
-            OVERRIDES="{\"containerOverrides\": [{\"name\": \"${CONTAINER_NAME}\"}]}"
-          fi
+          EXECUTION_ARN=$(aws stepfunctions start-execution \
+            --state-machine-arn "${STATE_MACHINE_ARN}" \
+            --input "{\"start_month\": \"${{ github.event.inputs.start_month }}\", \"end_month\": \"${{ github.event.inputs.end_month }}\"}" \
+            --query 'executionArn' --output text)
 
-          SUBNETS=$(aws ec2 describe-subnets \
-            --filters "Name=default-for-az,Values=true" \
-            --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+          echo "Pipeline started: ${EXECUTION_ARN}"
 
-          SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=${ECS_CLUSTER}-ecs-*" \
-            --query 'SecurityGroups[0].GroupId' --output text)
+          while true; do
+            STATUS=$(aws stepfunctions describe-execution \
+              --execution-arn "${EXECUTION_ARN}" \
+              --query 'status' --output text)
 
-          echo "Running task: ${FAMILY}"
-          TASK_ARN=$(aws ecs run-task \
-            --cluster "${ECS_CLUSTER}" \
-            --task-definition "${FAMILY}" \
-            --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SG_ID}],assignPublicIp=ENABLED}" \
-            --overrides "${OVERRIDES}" \
-            --query 'tasks[0].taskArn' --output text)
+            echo "Status: ${STATUS}"
 
-          echo "Task started: ${TASK_ARN}"
+            if [ "${STATUS}" = "SUCCEEDED" ]; then
+              echo "Pipeline completed successfully"
+              break
+            elif [ "${STATUS}" = "FAILED" ] || [ "${STATUS}" = "TIMED_OUT" ] || [ "${STATUS}" = "ABORTED" ]; then
+              echo "::error::Pipeline ${STATUS}"
+              exit 1
+            fi
 
-          echo "Waiting for task to complete..."
-          aws ecs wait tasks-stopped \
-            --cluster "${ECS_CLUSTER}" \
-            --tasks "${TASK_ARN}"
-
-          EXIT_CODE=$(aws ecs describe-tasks \
-            --cluster "${ECS_CLUSTER}" \
-            --tasks "${TASK_ARN}" \
-            --query 'tasks[0].containers[0].exitCode' --output text)
-
-          echo "Task exit code: ${EXIT_CODE}"
-          if [ "${EXIT_CODE}" != "0" ]; then
-            echo "::error::ECS task failed with exit code ${EXIT_CODE}"
-            exit 1
-          fi
+            sleep 30
+          done

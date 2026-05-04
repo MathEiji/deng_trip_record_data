@@ -78,6 +78,11 @@ resource "aws_iam_role_policy" "ecs_task_glue" {
           "glue:UpdateTable",
           "glue:DeleteTable",
           "glue:GetPartitions",
+          "glue:GetPartition",
+          "glue:CreatePartition",
+          "glue:UpdatePartition",
+          "glue:BatchCreatePartition",
+          "glue:BatchUpdatePartition",
         ]
         Resource = [
           "arn:aws:glue:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:catalog",
@@ -176,6 +181,27 @@ resource "aws_iam_role_policy" "github_actions" {
         Action = [
           "ec2:DescribeSubnets",
           "ec2:DescribeSecurityGroups",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "StepFunctionsExecute"
+        Effect = "Allow"
+        Action = [
+          "states:StartExecution",
+        ]
+        Resource = aws_sfn_state_machine.pipeline.arn
+      },
+      {
+        Sid    = "StepFunctionsReadOnly"
+        Effect = "Allow"
+        Action = [
+          "states:ListStateMachines",
+          "states:DescribeStateMachine",
+          "states:ListExecutions",
+          "states:DescribeExecution",
+          "states:GetExecutionHistory",
+          "states:ListTagsForResource",
         ]
         Resource = "*"
       }

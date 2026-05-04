@@ -43,3 +43,8 @@ variable "glue_database" {
   type        = string
   default     = "trip_record_data"
 }
+
+variable "alert_emails" {
+  description = "Email addresses for AWS budget alerts"
+  type        = list(string)
+}

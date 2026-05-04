@@ -6,3 +6,5 @@ s3_bucket_name = "your-globally-unique-bucket-name"
 start_month    = "2025-01"
 end_month      = "2025-06"
 glue_database  = "trip_record_data"
+alert_emails   = ["matheus.eiji@gmail.com", "leandro.sousa@live.com", "caiotmarini@gmail.com
+", "jgalbino1@gmail.com"]

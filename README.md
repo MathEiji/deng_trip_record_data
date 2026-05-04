@@ -192,7 +192,7 @@ Após o `terraform apply`, configure o secret no GitHub:
 
 > Para instruções detalhadas passo a passo, consulte o [RUNBOOK.md](RUNBOOK.md).
 
----
+### 2. Raw layer (`build_raw_layer.py`)
 
 ## Execução da Aplicação
 
