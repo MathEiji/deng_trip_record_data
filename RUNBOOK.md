@@ -11,8 +11,8 @@ Procedimentos operacionais para preparação, execução, validação e manuten�
 - [2. Provisionamento da Infraestrutura (Terraform)](#2-provisionamento-da-infraestrutura-terraform)
 - [3. Configuração do CI/CD (GitHub Actions)](#3-configuração-do-cicd-github-actions)
 - [4. Build e Push da Imagem Docker](#4-build-e-push-da-imagem-docker)
-- [5. Execução do Pipeline — Download dos Dados](#5-execução-do-pipeline--download-dos-dados)
-- [6. Execução do Pipeline — Construção da Camada Raw](#6-execução-do-pipeline--construção-da-camada-raw)
+- [5. Execução do Pipeline Completo (Step Functions)](#5-execução-do-pipeline-completo-step-functions)
+- [6. Execução de Etapas Individuais](#6-execução-de-etapas-individuais)
 - [7. Validação e Testes](#7-validação-e-testes)
 - [8. Reexecução e Reprocessamento](#8-reexecução-e-reprocessamento)
 - [9. Problemas Conhecidos e Limitações](#9-problemas-conhecidos-e-limitações)
@@ -36,23 +36,25 @@ Procedimentos operacionais para preparação, execução, validação e manuten�
 
 ### Contas e Acessos
 
-- **Conta AWS** com permissões para criar: S3, ECR, ECS, IAM, Glue, CloudWatch
+- **Conta AWS** com permissões para criar: S3, ECR, ECS, IAM, Glue, Step Functions, CloudWatch, Budgets
 - **Repositório GitHub** com permissão para configurar secrets e GitHub Actions
-- **AWS CLI configurado** com credenciais válidas (`aws configure` ou variáveis de ambiente)
+- **AWS CLI configurado** com credenciais válidas (`aws configure`)
 
 ### Variáveis de Ambiente (referência)
 
 | Variável | Obrigatória | Descrição | Padrão |
 |----------|-------------|-----------|--------|
 | `S3_BUCKET` | Sim | Nome do bucket S3 para dados | — |
-| `S3_PREFIX` | Não | Prefixo para staging no S3 | `staging` |
+| `START_MONTH` | Sim | Mês inicial no formato `YYYY-MM` | — |
+| `END_MONTH` | Sim | Mês final no formato `YYYY-MM` | — |
+| `S3_PREFIX` | Não | Prefixo para staging (download) | `staging` |
 | `S3_STAGING_PREFIX` | Não | Prefixo de staging (build raw) | `staging` |
 | `S3_RAW_PREFIX` | Não | Prefixo de saída raw | `raw` |
-| `START_MONTH` | Sim (download) | Mês inicial no formato `YYYY-MM` | — |
-| `END_MONTH` | Sim (download) | Mês final no formato `YYYY-MM` | — |
+| `S3_TRUSTED_PREFIX` | Não | Prefixo de saída trusted | `trusted` |
+| `S3_SPECIALIZED_PREFIX` | Não | Prefixo de saída specialized | `specialized` |
 | `GLUE_DATABASE` | Não | Nome do database no Glue Catalog | `trip_record_data` |
 | `AWS_REGION` | Não | Região AWS | `us-east-1` |
-| `SKIP_QUALITY_ANALYSIS` | Não | Pular análise de qualidade | `false` |
+| `SKIP_QUALITY_ANALYSIS` | Não | Pular análise de qualidade (raw) | `false` |
 
 ---
 
@@ -112,8 +114,9 @@ github_org     = "seu-usuario-github"
 github_repo    = "deng_trip_record_data"
 s3_bucket_name = "nome-unico-global-do-bucket"
 start_month    = "2025-01"
-end_month      = "2025-06"
+end_month      = "2025-12"
 glue_database  = "trip_record_data"
+alert_emails   = ["email@exemplo.com"]
 ```
 
 > **Importante:** o `s3_bucket_name` deve ser globalmente único na AWS.
@@ -140,32 +143,43 @@ Outputs relevantes:
 | `ecs_cluster_name` | Nome do cluster ECS |
 | `s3_bucket_name` | Bucket de dados |
 | `github_actions_role_arn` | ARN da role para GitHub Actions |
+| `state_machine_arn` | ARN do Step Functions |
 | `security_group_id` | SG para tasks ECS |
 | `subnet_ids` | Subnets para tasks ECS |
 
 ### 2.4 Recursos criados
 
-- Bucket S3 para dados (staging + raw)
+- Bucket S3 para dados (staging + raw + trusted + specialized)
 - Bucket S3 para Terraform state (com versionamento)
 - ECR repository com lifecycle policy (mantém últimas 5 imagens)
-- ECS Cluster + 2 Task Definitions (download e build-raw)
+- ECS Cluster + 7 Task Definitions:
+  - `trip-record-data-download` (0.25 vCPU / 512 MB)
+  - `trip-record-data-build-raw` (1 vCPU / 4 GB / 21 GB ephemeral)
+  - `trip-record-data-build-trusted` (1 vCPU / 4 GB / 21 GB ephemeral)
+  - `trip-record-data-build-spec-hourly-volume` (0.5 vCPU / 2 GB)
+  - `trip-record-data-build-spec-daily-volume` (0.5 vCPU / 2 GB)
+  - `trip-record-data-build-spec-trip-distance` (0.5 vCPU / 2 GB)
+  - `trip-record-data-build-spec-distance-fare` (0.5 vCPU / 2 GB)
+- Step Functions state machine (download → raw → trusted → specialized em paralelo)
 - Security Group (egress-only)
-- IAM Roles: ECS execution, ECS task, GitHub Actions (OIDC)
+- IAM Roles: ECS execution, ECS task, GitHub Actions (OIDC), Step Functions
 - IAM Users para desenvolvedores (leandro.sousa, caio.ribeiro, joao.albino)
 - Glue Data Catalog database
 - CloudWatch Log Group (retenção 1 dia)
+- AWS Budgets (alertas em 50%, 80%, 100% de $10/mês)
 
 ---
 
 ## 3. Configuração do CI/CD (GitHub Actions)
 
-### 3.1 Configurar secret no GitHub
+### 3.1 Configurar secrets no GitHub
 
 No repositório GitHub, ir em **Settings → Secrets and variables → Actions** e criar:
 
 | Secret | Valor |
 |--------|-------|
-| `AWS_ROLE_ARN` | Valor do output `github_actions_role_arn` do Terraform |
+| `AWS_ROLE_ARN` | Valor do output `github_actions_role_arn` |
+| `STATE_MACHINE_ARN` | Valor do output `state_machine_arn` |
 
 ### 3.2 Trigger automático
 
@@ -178,11 +192,11 @@ O workflow é acionado automaticamente em pushes para `main` que alteram:
 
 No GitHub, ir em **Actions → Build & Deploy → Run workflow** e configurar:
 
-| Parâmetro | Opções | Descrição |
-|-----------|--------|-----------|
-| `run_task` | `none`, `download`, `build_raw` | Qual task executar após deploy |
-| `start_month` | `YYYY-MM` | Mês inicial (usado pelo download) |
-| `end_month` | `YYYY-MM` | Mês final (usado pelo download) |
+| Parâmetro | Tipo | Descrição |
+|-----------|------|-----------|
+| `run_pipeline` | boolean | Executar o Step Functions após deploy |
+| `start_month` | string | Mês inicial `YYYY-MM` |
+| `end_month` | string | Mês final `YYYY-MM` |
 
 ---
 
@@ -214,99 +228,134 @@ docker push <ECR_REPOSITORY_URL>:latest
 
 ---
 
-## 5. Execução do Pipeline — Download dos Dados
+## 5. Execução do Pipeline Completo (Step Functions)
 
 ### 5.1 Via GitHub Actions (recomendado)
 
 1. Ir em **Actions → Build & Deploy → Run workflow**
-2. Selecionar `run_task: download`
+2. Marcar `run_pipeline: true`
 3. Informar `start_month` e `end_month`
 4. Clicar em **Run workflow**
-5. Acompanhar os logs na aba do workflow
+5. O workflow dispara o Step Functions e aguarda conclusão (polling a cada 30s)
 
-### 5.2 Via AWS CLI (execução direta no ECS)
+### 5.2 Via AWS CLI
 
 ```bash
-SUBNETS=$(aws ec2 describe-subnets \
-  --filters "Name=default-for-az,Values=true" \
-  --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+aws stepfunctions start-execution \
+  --state-machine-arn <STATE_MACHINE_ARN> \
+  --input '{"start_month": "2025-01", "end_month": "2025-12"}'
+```
 
-SG_ID=$(terraform -chdir=infra output -raw security_group_id)
+### 5.3 Fluxo de execução
 
+O Step Functions executa na seguinte ordem:
+
+```
+1. DownloadTripData     (sequencial)
+2. BuildRawLayer        (sequencial — depende do download)
+3. BuildTrustedLayer    (sequencial — depende do raw)
+4. BuildSpecializedLayer (PARALELO — 4 tasks simultâneas)
+   ├── spec_hourly_volume
+   ├── spec_daily_volume
+   ├── spec_trip_distance
+   └── spec_distance_fare
+```
+
+Cada etapa usa `runTask.sync` — o Step Functions espera a task ECS terminar antes de avançar. Se uma etapa falha, o pipeline para.
+
+### 5.4 Monitorar execução
+
+```bash
+# Listar execuções recentes
+aws stepfunctions list-executions \
+  --state-machine-arn <STATE_MACHINE_ARN> \
+  --max-results 5
+
+# Ver status de uma execução
+aws stepfunctions describe-execution \
+  --execution-arn <EXECUTION_ARN>
+```
+
+---
+
+## 6. Execução de Etapas Individuais
+
+Cada etapa pode ser executada isoladamente via ECS `run-task`:
+
+### 6.1 Download
+
+```bash
 aws ecs run-task \
   --cluster trip-record-data \
   --task-definition trip-record-data-download \
   --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+  --network-configuration "awsvpcConfiguration={subnets=[<SUBNETS>],securityGroups=[<SG_ID>],assignPublicIp=ENABLED}" \
   --overrides '{
     "containerOverrides": [{
       "name": "download-trip-data",
       "environment": [
         {"name": "START_MONTH", "value": "2025-01"},
-        {"name": "END_MONTH", "value": "2025-06"}
+        {"name": "END_MONTH", "value": "2025-12"}
       ]
     }]
   }'
 ```
 
-### 5.3 Execução local (desenvolvimento)
-
-```bash
-python app/src/download_trip_data.py 2025-01 2025-06 --bucket meu-bucket
-```
-
-### 5.4 Verificar resultado
-
-```bash
-aws s3 ls s3://meu-bucket/staging/ --human-readable
-```
-
-Deve listar arquivos como `fhvhv_tripdata_2025-01.parquet`, `fhvhv_tripdata_2025-02.parquet`, etc.
-
----
-
-## 6. Execução do Pipeline — Construção da Camada Raw
-
-### 6.1 Via GitHub Actions (recomendado)
-
-1. Ir em **Actions → Build & Deploy → Run workflow**
-2. Selecionar `run_task: build_raw`
-3. Clicar em **Run workflow**
-4. Acompanhar os logs na aba do workflow
-
-### 6.2 Via AWS CLI (execução direta no ECS)
+### 6.2 Build Raw
 
 ```bash
 aws ecs run-task \
   --cluster trip-record-data \
   --task-definition trip-record-data-build-raw \
   --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}"
+  --network-configuration "awsvpcConfiguration={subnets=[<SUBNETS>],securityGroups=[<SG_ID>],assignPublicIp=ENABLED}" \
+  --overrides '{
+    "containerOverrides": [{
+      "name": "build-raw-layer",
+      "environment": [
+        {"name": "START_MONTH", "value": "2025-01"},
+        {"name": "END_MONTH", "value": "2025-12"}
+      ]
+    }]
+  }'
 ```
 
-### 6.3 O que o build-raw faz
-
-1. Descobre os arquivos de staging no S3
-2. Executa análise de qualidade (nulos, distribuições, estatísticas) — pode ser pulada com `SKIP_QUALITY_ANALYSIS=true`
-3. Materializa os dados com `trip_id` e `processed_date`
-4. Gera 4 tabelas raw no S3 (`raw_dispatch_base`, `raw_trip_time_location`, `raw_fare_payment`, `raw_request_flags`)
-5. Converte CSVs de referência em tabelas dimensão Parquet (`dim_hvfhs_license`, `dim_base`)
-6. Valida contagem de linhas e consistência de joins
-7. Registra todas as tabelas no AWS Glue Data Catalog
-
-### 6.4 Verificar resultado
+### 6.3 Build Trusted
 
 ```bash
-# Listar tabelas raw no S3
-aws s3 ls s3://meu-bucket/raw/ --recursive --human-readable
-
-# Verificar tabelas no Glue
-aws glue get-tables --database-name trip_record_data --query 'TableList[].Name'
+aws ecs run-task \
+  --cluster trip-record-data \
+  --task-definition trip-record-data-build-trusted \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[<SUBNETS>],securityGroups=[<SG_ID>],assignPublicIp=ENABLED}" \
+  --overrides '{
+    "containerOverrides": [{
+      "name": "build-trusted-layer",
+      "environment": [
+        {"name": "START_MONTH", "value": "2025-01"},
+        {"name": "END_MONTH", "value": "2025-12"}
+      ]
+    }]
+  }'
 ```
 
-Saída esperada do Glue:
-```json
-["raw_dispatch_base", "raw_trip_time_location", "raw_fare_payment", "raw_request_flags", "dim_hvfhs_license", "dim_base"]
+### 6.4 Build Specialized (exemplo: hourly volume)
+
+```bash
+aws ecs run-task \
+  --cluster trip-record-data \
+  --task-definition trip-record-data-build-spec-hourly-volume \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[<SUBNETS>],securityGroups=[<SG_ID>],assignPublicIp=ENABLED}" \
+  --overrides '{
+    "containerOverrides": [{
+      "name": "build-spec-hourly-volume",
+      "environment": [
+        {"name": "START_MONTH", "value": "2025-01"},
+        {"name": "END_MONTH", "value": "2025-12"}
+      ]
+    }]
+  }'
 ```
 
 ---
@@ -315,46 +364,45 @@ Saída esperada do Glue:
 
 ### 7.1 Validação automática (embutida no pipeline)
 
-O script `build_raw_layer.py` executa automaticamente:
+Cada etapa do pipeline executa validações automaticamente:
 
-- **Contagem de linhas:** cada tabela raw deve ter o mesmo número de linhas que o staging
-- **Consistência de joins:** join das 4 tabelas raw por `trip_id` em uma amostra de 100k linhas — todas devem casar
-- **Tabelas dimensão:** verifica que cada dimensão tem > 0 linhas
+**Raw:**
+- Contagem de linhas: cada tabela raw deve ter o mesmo número de linhas que o staging
+- Consistência de joins: as 4 tabelas devem casar 100% por `trip_id`
+- Tabelas dimensão: verifica que cada dimensão tem > 0 linhas
 
-O pipeline retorna exit code `1` se qualquer validação falhar.
+**Trusted:**
+- Contagem de linhas (registra quantos foram filtrados e o percentual)
+- Verificação de nulos em campos derivados (`company_name`, `pickup_hour`, `total_fare`, `fare_per_mile`)
+- Ranges dos valores (trip_miles, fare, trip_time dentro dos limites esperados)
+
+**Specialized:**
+- Contagem de linhas > 0
+- Soma de `trip_count` deve bater com o total da trusted (para tabelas com essa métrica)
+
+Se qualquer validação crítica falha, o script retorna exit code 1 e o Step Functions marca a etapa como FAILED.
 
 ### 7.2 Validação manual via Athena
 
 ```sql
--- Contagem por tabela
-SELECT 'dispatch' AS tbl, COUNT(*) AS n FROM trip_record_data.raw_dispatch_base
-UNION ALL
-SELECT 'time_loc', COUNT(*) FROM trip_record_data.raw_trip_time_location
-UNION ALL
-SELECT 'fare', COUNT(*) FROM trip_record_data.raw_fare_payment
-UNION ALL
-SELECT 'flags', COUNT(*) FROM trip_record_data.raw_request_flags;
+-- Verificar tabelas registradas no Glue
+SELECT * FROM information_schema.tables
+WHERE table_schema = 'trip_record_data';
 
--- Consistência de join
-SELECT COUNT(*)
-FROM trip_record_data.raw_dispatch_base d
-JOIN trip_record_data.raw_trip_time_location t ON d.trip_id = t.trip_id
-JOIN trip_record_data.raw_fare_payment f ON d.trip_id = f.trip_id
-JOIN trip_record_data.raw_request_flags r ON d.trip_id = r.trip_id;
+-- Contagem por camada
+SELECT 'raw_dispatch_base' AS tbl, COUNT(*) AS n FROM trip_record_data.raw_dispatch_base WHERE year_month = 202506
+UNION ALL
+SELECT 'trusted_trips', COUNT(*) FROM trip_record_data.trusted_trips WHERE year_month = 202506
+UNION ALL
+SELECT 'spec_hourly_volume', COUNT(*) FROM trip_record_data.spec_hourly_volume WHERE year_month = 202506;
+
+-- Verificar filtros da trusted (quantos registros foram removidos)
+SELECT
+  (SELECT COUNT(*) FROM trip_record_data.raw_dispatch_base WHERE year_month = 202506) AS raw_count,
+  (SELECT COUNT(*) FROM trip_record_data.trusted_trips WHERE year_month = 202506) AS trusted_count;
 ```
 
-### 7.3 Validação via DuckDB (local)
-
-```python
-import duckdb
-con = duckdb.connect()
-
-for table in ['raw_dispatch_base', 'raw_trip_time_location', 'raw_fare_payment', 'raw_request_flags']:
-    n = con.execute(f"SELECT COUNT(*) FROM read_parquet('data/raw/{table}.parquet')").fetchone()[0]
-    print(f"{table}: {n:,} rows")
-```
-
-### 7.4 Verificar logs do ECS
+### 7.3 Verificar logs do ECS
 
 ```bash
 # Listar log streams recentes
@@ -364,10 +412,19 @@ aws logs describe-log-streams \
   --descending \
   --limit 5
 
-# Ler logs de um stream específico
-aws logs get-log-events \
+# Filtrar por erros
+aws logs filter-log-events \
   --log-group-name /ecs/trip-record-data \
-  --log-stream-name <stream-name>
+  --filter-pattern "ERROR"
+```
+
+### 7.4 Verificar execução do Step Functions
+
+```bash
+# Ver histórico de uma execução
+aws stepfunctions get-execution-history \
+  --execution-arn <EXECUTION_ARN> \
+  --query 'events[?type==`TaskFailed` || type==`TaskSucceeded`]'
 ```
 
 ---
@@ -376,33 +433,38 @@ aws logs get-log-events \
 
 ### 8.1 Re-download de dados
 
-O script de download é **idempotente**: arquivos que já existem no S3 são automaticamente pulados. Para forçar o re-download de um mês específico, delete o arquivo do S3 primeiro:
+O script de download é **idempotente**: arquivos que já existem no S3 são pulados. Para forçar o re-download:
 
 ```bash
 aws s3 rm s3://meu-bucket/staging/fhvhv_tripdata_2025-03.parquet
 ```
 
-Depois execute o download normalmente.
+### 8.2 Reprocessamento de uma camada específica
 
-### 8.2 Reprocessamento da camada raw
+Cada camada pode ser reprocessada independentemente via `run-task` (seção 6). As camadas usam `OVERWRITE_OR_IGNORE` — partições existentes são sobrescritas.
 
-O build-raw **sobrescreve** as tabelas raw existentes no S3 e atualiza as definições no Glue. Para reprocessar:
+### 8.3 Reprocessamento completo
 
-1. Execute o build-raw novamente (via GitHub Actions ou CLI)
-2. As tabelas serão recriadas com um novo `processed_date`
-3. O Glue será atualizado automaticamente
+Execute o Step Functions novamente com o mesmo input. Todas as camadas serão recriadas e o Glue será atualizado.
 
-### 8.3 Adicionar novos meses
+### 8.4 Adicionar novos meses
 
-1. Execute o download com o novo intervalo de meses
-2. Execute o build-raw — ele processa **todos** os arquivos de staging encontrados no S3
+Execute o pipeline com o novo intervalo. Exemplo para adicionar julho-dezembro:
 
-### 8.4 Atualizar tabelas dimensão
+```bash
+aws stepfunctions start-execution \
+  --state-machine-arn <STATE_MACHINE_ARN> \
+  --input '{"start_month": "2025-07", "end_month": "2025-12"}'
+```
+
+As partições novas serão criadas sem afetar as existentes.
+
+### 8.5 Atualizar tabelas dimensão
 
 1. Edite os CSVs em `reference/` (`dim_hvfhs_license.csv`, `dim_base.csv`)
 2. Faça commit e push para `main`
 3. O CI/CD rebuilda a imagem automaticamente
-4. Execute o build-raw para regenerar as dimensões em Parquet
+4. Execute o pipeline para regenerar as camadas que dependem das dimensões (raw + trusted + specialized)
 
 ---
 
@@ -410,59 +472,66 @@ O build-raw **sobrescreve** as tabelas raw existentes no S3 e atualiza as defini
 
 | Problema | Descrição | Mitigação |
 |----------|-----------|-----------|
-| **Timeout no download** | Arquivos grandes (~500 MB) podem causar timeout em conexões instáveis | O script usa streaming com chunks de 8 MB e multipart upload; re-executar pula arquivos já baixados |
-| **Memória no build-raw** | DuckDB materializa todos os dados de staging em memória/disco | A task ECS usa 4 GB de RAM + 40 GB de ephemeral storage; para volumes muito grandes, considerar processar em batches |
-| **Sem particionamento por data** | As tabelas raw são escritas como arquivo único por tabela | Para volumes maiores, implementar particionamento por `processed_date` ou mês |
-| **Sem Spot/Savings Plans** | O pipeline usa Fargate on-demand | Aceitável para execuções esporádicas; para execuções frequentes, considerar Fargate Spot |
-| **Retenção de logs curta** | CloudWatch Logs com retenção de 1 dia | Aumentar em `cloudwatch.tf` se necessário para debugging |
-| **Free tier limitado** | ECS Fargate free tier válido por 12 meses | Monitorar custos após o período de free tier |
-| **Dados disponíveis com atraso** | A TLC publica os dados com ~2 meses de atraso | Verificar disponibilidade antes de configurar o intervalo de meses |
+| **Timeout no download** | Arquivos grandes (~500 MB) podem causar timeout em conexões instáveis | Streaming com chunks de 8 MB + multipart upload; re-executar pula arquivos já baixados |
+| **Memória no build-raw/trusted** | DuckDB materializa dados em memória | Tasks com 4 GB RAM + 21 GB ephemeral; trusted usa `memory_limit='3GB'` para forçar spill to disk |
+| **Dados disponíveis com atraso** | A TLC publica com ~2 meses de atraso | Verificar disponibilidade antes de configurar o intervalo |
+| **Retenção de logs curta** | CloudWatch com retenção de 1 dia | Aumentar em `cloudwatch.tf` se necessário |
+| **Partições não são deletadas automaticamente** | Reprocessamento cria/atualiza partições mas não remove antigas | Limpar manualmente via Glue se necessário |
+| **Step Functions timeout** | Execução máxima padrão de 1 ano | Para o volume atual não é problema; monitorar se escalar |
 
 ---
 
 ## 10. Ações de Contingência
 
+### Step Functions falhou
+
+1. Verificar qual etapa falhou:
+   ```bash
+   aws stepfunctions get-execution-history \
+     --execution-arn <EXECUTION_ARN> \
+     --query 'events[?type==`TaskFailed`]'
+   ```
+2. Verificar logs da task ECS que falhou no CloudWatch
+3. Corrigir o problema e re-executar o pipeline (é idempotente)
+
 ### Task ECS falhou
 
-1. Verificar logs no CloudWatch:
+1. Verificar logs:
    ```bash
    aws logs filter-log-events \
      --log-group-name /ecs/trip-record-data \
      --filter-pattern "ERROR"
    ```
 2. Causas comuns:
-   - **Sem conectividade:** verificar se a task tem `assignPublicIp=ENABLED` e o security group permite egress
-   - **Permissão S3:** verificar a IAM role da task (`trip-record-data-ecs-task`)
-   - **Arquivo não encontrado no CDN:** o mês solicitado pode não estar disponível ainda
+   - **Sem conectividade:** verificar `assignPublicIp=ENABLED` e security group
+   - **Permissão S3/Glue:** verificar IAM role `trip-record-data-ecs-task`
+   - **Out of memory:** aumentar memória da task definition
+   - **Arquivo não encontrado no CDN:** mês pode não estar disponível ainda
 
 ### Terraform state corrompido
 
 1. O bucket de state tem versionamento habilitado
-2. Listar versões: `aws s3api list-object-versions --bucket <bucket>-tfstate --prefix trip-record-data/terraform.tfstate`
+2. Listar versões:
+   ```bash
+   aws s3api list-object-versions \
+     --bucket <bucket>-tfstate \
+     --prefix trip-record-data/terraform.tfstate
+   ```
 3. Restaurar versão anterior se necessário
 
 ### Glue tables inconsistentes
 
-1. Re-executar o build-raw — ele faz upsert (create or update) das tabelas no Glue
+1. Re-executar o pipeline — faz upsert (create or update) das tabelas e partições
 2. Para limpar manualmente:
    ```bash
    aws glue delete-table --database-name trip_record_data --name <table_name>
    ```
 
-### Imagem Docker não atualiza no ECS
-
-1. Verificar se o CI/CD completou com sucesso
-2. Verificar a imagem no ECR:
-   ```bash
-   aws ecr describe-images --repository-name trip-record-data --query 'imageDetails | sort_by(@, &imagePushedAt) | [-1]'
-   ```
-3. A task definition deve apontar para a imagem com o SHA do commit mais recente
-
 ### Custos inesperados
 
-1. Verificar o AWS Cost Explorer
-2. Principais fontes de custo: S3 storage, ECS Fargate compute, data transfer
+1. O AWS Budgets envia alertas em 50%, 80% e 100% de $10/mês
+2. Verificar AWS Cost Explorer
 3. Para reduzir custos:
-   - Deletar dados de staging após o build-raw: `aws s3 rm s3://meu-bucket/staging/ --recursive`
-   - Usar lifecycle policies no S3 para mover dados antigos para Glacier
-   - Reduzir a retenção de logs (já está em 1 dia)
+   - Deletar dados de staging após build-raw: `aws s3 rm s3://bucket/staging/ --recursive`
+   - Reduzir o número de meses processados
+   - Verificar se tasks ECS não ficaram "stuck" (running indefinidamente)
