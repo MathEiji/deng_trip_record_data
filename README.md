@@ -2,12 +2,15 @@
 
 # NYC TLC Trip Record Data Pipelines
 
-**Disciplina:** Engenharia de Dados — USP PECE Poli  
-**Grupo:**
-- Matheus Eiji
-- Leandro Sousa
+**Disciplina:** Projeto Integrador
+**Grupo:** H
 - Caio Ribeiro
 - João Albino
+- Leandro Sousa
+- Matheus Eiji
+
+
+
 
 **Repositório:** [github.com — deng_trip_record_data](https://github.com/MathEiji/deng_trip_record_data)
 
